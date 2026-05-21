@@ -601,6 +601,86 @@ export class CippService {
   }
 
   /**
+   * List the CIPP Standards Templates configured across the partner tenant.
+   * Calls the `listStandardTemplates` Azure Function.
+   */
+  async listStandardTemplates<T = unknown>(): Promise<T> {
+    // CIPP names this function with a lowercase 'l' — do not capitalise.
+    return this.request<T>('GET', 'listStandardTemplates');
+  }
+
+  /**
+   * Report standards drift for a tenant, or for every tenant when no
+   * `tenantFilter` is given. Calls the `ListTenantDrift` Azure Function.
+   *
+   * @param tenantFilter - Optional tenant domain or identifier.
+   */
+  async getTenantDrift<T = unknown>(tenantFilter?: string): Promise<T> {
+    return this.request<T>(
+      'GET',
+      'ListTenantDrift',
+      tenantFilter ? { tenantFilter } : undefined
+    );
+  }
+
+  /**
+   * Report each tenant's alignment percentage against its assigned
+   * Standards Templates, or for every tenant when no `tenantFilter` is
+   * given. Calls the `ListTenantAlignment` Azure Function.
+   *
+   * @param tenantFilter - Optional tenant domain or identifier.
+   */
+  async getTenantAlignment<T = unknown>(tenantFilter?: string): Promise<T> {
+    return this.request<T>(
+      'GET',
+      'ListTenantAlignment',
+      tenantFilter ? { tenantFilter } : undefined
+    );
+  }
+
+  /**
+   * Create or update a CIPP Standards Template (CIPP upserts by GUID).
+   * Calls the `AddStandardsTemplate` Azure Function.
+   *
+   * The template object is passed through to CIPP unchanged — cipp-mcp
+   * does not model CIPP's template schema, which keeps this tool stable
+   * across CIPP versions. Validation is intentionally light: the object
+   * must exist and carry a `tenantFilter` assigning it to at least one
+   * tenant (CIPP itself rejects templates without one).
+   *
+   * @param template - The full Standards Template JSON object.
+   */
+  async createStandardTemplate<T = unknown>(
+    template: Record<string, unknown>
+  ): Promise<T> {
+    if (template === null || typeof template !== 'object' || Array.isArray(template)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Standards template must be a JSON object.'
+      );
+    }
+    if (template.tenantFilter === undefined || template.tenantFilter === null) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'Standards template must include a "tenantFilter" assigning it to at least one tenant.'
+      );
+    }
+    return this.request<T>('POST', 'AddStandardsTemplate', undefined, template);
+  }
+
+  /**
+   * Delete a CIPP Standards Template by ID.
+   * Calls the `RemoveStandardTemplate` Azure Function.
+   *
+   * @param templateId - The GUID of the Standards Template to delete.
+   */
+  async deleteStandardTemplate<T = unknown>(templateId: string): Promise<T> {
+    return this.request<T>('POST', 'RemoveStandardTemplate', undefined, {
+      ID: templateId,
+    });
+  }
+
+  /**
    * Retrieve Best Practice Analyser (BPA) results for a tenant.
    * Calls the `ListBPA` Azure Function.
    *
