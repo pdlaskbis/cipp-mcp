@@ -43,7 +43,7 @@ Set these environment variables (or copy `.env.example` to `.env`):
 
 | Variable | Required | Description |
 |---|---|---|
-| `CIPP_BASE_URL` | Yes | Your CIPP deployment URL (e.g. `https://cipp.yourdomain.com`) |
+| `CIPP_BASE_URL` | Yes | Your CIPP **Azure Function App** URL (e.g. `https://cippXXXXX.azurewebsites.net`). **Do not use the SWA / frontend URL** — see [Finding your Function App URL](#finding-your-function-app-url). |
 | `CIPP_API_KEY` | One of | Static Bearer token. Use this **or** the OAuth trio below. |
 | `CIPP_TENANT_ID` | One of | Entra tenant ID that owns the CIPP API-client app registration. |
 | `CIPP_CLIENT_ID` | One of | OAuth client ID issued by CIPP's API Client Management page. |
@@ -65,13 +65,19 @@ Add to your `claude_desktop_config.json`:
       "command": "node",
       "args": ["/path/to/cipp-mcp/dist/entry.js"],
       "env": {
-        "CIPP_BASE_URL": "https://cipp.yourdomain.com",
-        "CIPP_API_KEY": "your-api-key"
+        "CIPP_BASE_URL": "https://cippXXXXX.azurewebsites.net",
+        "CIPP_TENANT_ID": "your-entra-tenant-id",
+        "CIPP_CLIENT_ID": "your-client-id",
+        "CIPP_CLIENT_SECRET": "your-client-secret"
       }
     }
   }
 }
 ```
+
+> **Note:** `CIPP_BASE_URL` must be the Azure **Function App** URL (`.azurewebsites.net`), not
+> the frontend SWA URL (`.azurestaticapps.net` or your custom domain). The SWA enforces
+> browser-based auth and will redirect all API requests to a Microsoft login page.
 
 ## Tools
 
@@ -101,9 +107,9 @@ its expiry.
 2. Create a new API client
 3. Copy the **Client ID** and **Client Secret** — you will not be able to
    retrieve the secret later
-4. Configure the server:
+4. Configure the server with the **Function App URL** (see below):
    ```env
-   CIPP_BASE_URL=https://cipp.yourdomain.com
+   CIPP_BASE_URL=https://cippXXXXX.azurewebsites.net
    CIPP_TENANT_ID=<your-entra-tenant-id>
    CIPP_CLIENT_ID=<client-id-from-cipp>
    CIPP_CLIENT_SECRET=<client-secret-from-cipp>
@@ -112,6 +118,35 @@ its expiry.
 If you already have a static Bearer token (older CIPP deployments), set
 `CIPP_API_KEY` instead and leave the OAuth variables unset. When both are
 provided, `CIPP_API_KEY` wins.
+
+## Finding your Function App URL
+
+CIPP runs as an Azure Static Web App (SWA) backed by an Azure Function App.
+The SWA URL (your custom domain or `*.azurestaticapps.net`) enforces browser-only
+auth and **cannot be used as `CIPP_BASE_URL`**. Use the Function App URL instead.
+
+**Self-hosted CIPP:** Find the Function App in the Azure portal (look for an App Service
+with `Kind: functionapp` in the same resource group as your SWA), or run:
+```sh
+az staticwebapp show --name <your-swa-name> --resource-group <rg> \
+  --query "linkedBackends[0].backendResourceId" -o tsv
+```
+
+**CIPP-sponsored hosting:** Contact the CIPP team for your instance's Function App URL —
+it is not the same as the URL shown in your browser.
+
+## IP Allowlist
+
+CIPP validates each API client against an `IPRange` field stored in Azure Table Storage.
+If your server's public IP is not in this list, you will receive:
+
+> `Access to this CIPP API endpoint is not allowed, the API Client does not have the required permission`
+
+**Self-hosted:** Add your IP via the CIPP UI (Settings → API Client Management) or
+directly in the `ApiClients` table of your CIPP storage account.
+
+**CIPP-sponsored hosting:** Ask the CIPP team to add your server's public IP to your
+API client's allowed range.
 
 ## License
 
