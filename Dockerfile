@@ -17,6 +17,9 @@ RUN npm run build
 
 FROM node:22-alpine AS production
 
+# Pull latest Alpine package fixes (e.g. OpenSSL) even when the base layer is cached
+RUN apk -U upgrade --no-cache
+
 RUN addgroup -g 1001 -S cipp && \
     adduser -S cipp -u 1001 -G cipp
 
@@ -28,6 +31,9 @@ COPY --from=builder /app/node_modules ./node_modules
 
 # Prune dev deps in builder stage (avoids re-auth to registries in prod stage)
 RUN npm prune --omit=dev && npm cache clean --force
+
+# Remove the npm CLI from the runtime image (not needed at runtime; clears npm-bundled CVEs)
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 RUN mkdir -p /app/logs && chown -R cipp:cipp /app
 

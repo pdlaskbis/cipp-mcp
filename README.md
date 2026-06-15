@@ -54,6 +54,14 @@ Set these environment variables (or copy `.env.example` to `.env`):
 | `MCP_HTTP_PORT` | No | Port for HTTP mode (default: 8080) |
 | `LOG_LEVEL` | No | `error`, `warn`, `info` (default), or `debug` |
 
+> [!IMPORTANT]
+> `CIPP_BASE_URL` must be the **Azure Function App** URL — the CIPP-API backend,
+> `https://<function-app-name>.azurewebsites.net` — **not** the Static Web App /
+> custom-domain UI URL (e.g. `https://cipp.yourdomain.com`). The SWA's built-in
+> auth intercepts bearer tokens and redirects them to its interactive login page,
+> so every API call fails. Find the Function App (named like `cippXXXXX`) in your
+> CIPP resource group in the Azure Portal.
+
 ## Usage with Claude Desktop
 
 Add to your `claude_desktop_config.json`:
