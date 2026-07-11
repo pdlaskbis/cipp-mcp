@@ -922,8 +922,243 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       },
     },
   },
+  // -------------------------------------------------------------------------
+  // Exchange write depth + BEC containment (CIPP-API 10.6.0)
+  // Closes CIPP Daily Ops Manual gaps — pdlaskbis/cyberdrain_cipp issue #1.
+  // -------------------------------------------------------------------------
+  {
+    name: 'cipp_list_mailbox_rules',
+    description:
+      'Lists the inbox rules configured on mailboxes in a tenant. Read-only. ' +
+      'Primary use is spotting malicious rule-based forwarding or message ' +
+      'hiding during compromise review (Manual Task 5/6). Note: CIPP builds ' +
+      'this data into a per-tenant cache asynchronously — a cold tenant may ' +
+      'first return a "still loading, check back in a minute" queue message ' +
+      'instead of rows; call again shortly after.',
+    annotations: {
+      title: 'List mailbox inbox rules',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
+    name: 'cipp_remove_mailbox_rule',
+    description:
+      '⚠ HIGH-IMPACT. Permanently removes a single inbox rule from a mailbox. ' +
+      'Used to strip attacker-created forwarding/hiding rules during BEC ' +
+      'response (Manual Task 5/6). Not reversible — the rule must be recreated ' +
+      'by hand if removed in error. Confirm with the user before invoking.',
+    annotations: {
+      title: 'Remove mailbox inbox rule (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        userPrincipalName: {
+          type: 'string',
+          description: 'UPN of the mailbox the rule belongs to.',
+        },
+        ruleId: {
+          type: 'string',
+          description:
+            'The mailbox-qualified rule identifier as returned by cipp_list_mailbox_rules. ' +
+            'CIPP derives the mailbox object id from this value.',
+        },
+        ruleName: {
+          type: 'string',
+          description: 'Optional display name of the rule, used for logging.',
+        },
+      },
+      required: ['tenantFilter', 'userPrincipalName', 'ruleId'],
+    },
+  },
+  {
+    name: 'cipp_bec_remediate',
+    description:
+      '⚠ HIGH-IMPACT. Runs the full bundled Business Email Compromise ' +
+      'containment sequence against a suspected-compromised account, in order: ' +
+      'reset password, disable account, revoke all sessions, remove MFA ' +
+      'methods, disable inbox rules, and disable OneDrive sharing. Returns a ' +
+      'per-step result list. This is the one-call containment path for Manual ' +
+      'Task 6. Locks the user out immediately. Confirm with the user before ' +
+      'invoking, and prefer raising the Autotask Security Incident ticket and ' +
+      'preserving evidence first where time allows.',
+    annotations: {
+      title: 'BEC remediate — full containment (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        userId: {
+          type: 'string',
+          description: "The compromised user's Azure AD object id.",
+        },
+        username: {
+          type: 'string',
+          description: "The compromised user's UPN (e.g. alice@contoso.com).",
+        },
+      },
+      required: ['tenantFilter', 'userId', 'username'],
+    },
+  },
+  {
+    name: 'cipp_edit_mailbox_permissions',
+    description:
+      '⚠ HIGH-IMPACT. Adds or removes mailbox delegation — FullAccess, SendAs, ' +
+      'or SendOnBehalf — for one or more delegate users on a target mailbox ' +
+      '(Manual Task 9). Granting FullAccess or SendAs exposes another user\u2019s ' +
+      'mail, so confirm with the user before invoking. Reversible by applying ' +
+      'the opposite operation.',
+    annotations: {
+      title: 'Edit mailbox permissions (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        upn: {
+          type: 'string',
+          description: 'UPN of the target mailbox whose permissions are being changed.',
+        },
+        addFullAccess: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to grant FullAccess (auto-mapping enabled).',
+        },
+        removeFullAccess: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to remove FullAccess from.',
+        },
+        addSendAs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to grant SendAs.',
+        },
+        removeSendAs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to remove SendAs from.',
+        },
+        addSendOnBehalf: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to grant SendOnBehalf.',
+        },
+        removeSendOnBehalf: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Delegate UPNs to remove SendOnBehalf from.',
+        },
+      },
+      required: ['tenantFilter', 'upn'],
+    },
+  },
+  {
+    name: 'cipp_convert_to_shared_mailbox',
+    description:
+      '⚠ HIGH-IMPACT. Converts a mailbox between Regular, Shared, and Room ' +
+      'types (Manual Task 9). Converting a licensed user mailbox to Shared is ' +
+      'a common offboarding step so the mailbox can be retained without a ' +
+      'license (under 50 GB). Reversible by converting back. Confirm with the ' +
+      'user before invoking.',
+    annotations: {
+      title: 'Convert mailbox type (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        id: {
+          type: 'string',
+          description: 'UPN or object id of the mailbox to convert.',
+        },
+        mailboxType: {
+          type: 'string',
+          enum: ['Regular', 'Shared', 'Room'],
+          description: 'Target mailbox type.',
+        },
+      },
+      required: ['tenantFilter', 'id', 'mailboxType'],
+    },
+  },
+  {
+    name: 'cipp_edit_group_members',
+    description:
+      '⚠ HIGH-IMPACT. Adds or removes members of a group (Manual Task 10). ' +
+      'Works for Security, Microsoft 365, Distribution, and Mail-Enabled ' +
+      'Security groups. Because security-group membership can drive Conditional ' +
+      'Access and license assignment, changes here can have broad downstream ' +
+      'effect. Reversible by the opposite operation. Confirm before invoking.',
+    annotations: {
+      title: 'Edit group members (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        groupId: {
+          type: 'string',
+          description: 'The object id of the group to modify.',
+        },
+        groupType: {
+          type: 'string',
+          enum: [
+            'Security',
+            'Microsoft 365',
+            'Distribution List',
+            'Mail-Enabled Security',
+          ],
+          description:
+            'The group type. Determines whether membership is changed via Graph ' +
+            '(security / M365) or Exchange (distribution / mail-enabled security).',
+        },
+        addMembers: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'UPNs of users to add to the group.',
+        },
+        removeMembers: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'UPNs of users to remove from the group.',
+        },
+      },
+      required: ['tenantFilter', 'groupId', 'groupType'],
+    },
+  },
 ];
-
 // ---------------------------------------------------------------------------
 // Tool Categories
 // ---------------------------------------------------------------------------
@@ -944,14 +1179,19 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_revoke_sessions',
     'cipp_offboard_user',
     'cipp_bec_check',
+    'cipp_bec_remediate',
     'cipp_list_mfa_users',
     'cipp_list_user_devices',
     'cipp_list_user_groups',
   ],
-  groups: ['cipp_list_groups', 'cipp_create_group'],
+  groups: ['cipp_list_groups', 'cipp_create_group', 'cipp_edit_group_members'],
   mailboxes: [
     'cipp_list_mailboxes',
     'cipp_list_mailbox_permissions',
+    'cipp_edit_mailbox_permissions',
+    'cipp_convert_to_shared_mailbox',
+    'cipp_list_mailbox_rules',
+    'cipp_remove_mailbox_rule',
     'cipp_set_out_of_office',
     'cipp_set_email_forwarding',
   ],

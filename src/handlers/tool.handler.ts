@@ -467,6 +467,97 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_list_mailbox_rules': {
+          const { tenantFilter } = args as { tenantFilter: string };
+          result = await this.cippService.listMailboxRules(tenantFilter);
+          break;
+        }
+
+        case 'cipp_remove_mailbox_rule': {
+          const { tenantFilter, userPrincipalName, ruleId, ruleName } = args as {
+            tenantFilter: string;
+            userPrincipalName: string;
+            ruleId: string;
+            ruleName?: string;
+          };
+          result = await this.cippService.removeMailboxRule(
+            tenantFilter,
+            userPrincipalName,
+            ruleId,
+            ruleName
+          );
+          break;
+        }
+
+        case 'cipp_bec_remediate': {
+          const { tenantFilter, userId, username } = args as {
+            tenantFilter: string;
+            userId: string;
+            username: string;
+          };
+          result = await this.cippService.becRemediate(tenantFilter, userId, username);
+          break;
+        }
+
+        case 'cipp_edit_mailbox_permissions': {
+          const {
+            tenantFilter,
+            upn,
+            addFullAccess,
+            removeFullAccess,
+            addSendAs,
+            removeSendAs,
+            addSendOnBehalf,
+            removeSendOnBehalf,
+          } = args as {
+            tenantFilter: string;
+            upn: string;
+            addFullAccess?: string[];
+            removeFullAccess?: string[];
+            addSendAs?: string[];
+            removeSendAs?: string[];
+            addSendOnBehalf?: string[];
+            removeSendOnBehalf?: string[];
+          };
+          const buckets: Record<string, string[]> = {};
+          if (addFullAccess) buckets.AddFullAccess = addFullAccess;
+          if (removeFullAccess) buckets.RemoveFullAccess = removeFullAccess;
+          if (addSendAs) buckets.AddSendAs = addSendAs;
+          if (removeSendAs) buckets.RemoveSendAs = removeSendAs;
+          if (addSendOnBehalf) buckets.AddSendOnBehalf = addSendOnBehalf;
+          if (removeSendOnBehalf) buckets.RemoveSendOnBehalf = removeSendOnBehalf;
+          result = await this.cippService.editMailboxPermissions(tenantFilter, upn, buckets);
+          break;
+        }
+
+        case 'cipp_convert_to_shared_mailbox': {
+          const { tenantFilter, id, mailboxType } = args as {
+            tenantFilter: string;
+            id: string;
+            mailboxType: string;
+          };
+          result = await this.cippService.convertMailbox(tenantFilter, id, mailboxType);
+          break;
+        }
+
+        case 'cipp_edit_group_members': {
+          const { tenantFilter, groupId, groupType, addMembers, removeMembers } = args as {
+            tenantFilter: string;
+            groupId: string;
+            groupType: string;
+            addMembers?: string[];
+            removeMembers?: string[];
+          };
+          result = await this.cippService.editGroupMembers(
+            tenantFilter,
+            groupId,
+            groupType,
+            addMembers,
+            removeMembers
+          );
+          break;
+        }
+
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }

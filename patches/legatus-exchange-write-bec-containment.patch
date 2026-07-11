@@ -548,7 +548,7 @@ index 35d8633..31dd598 100644
 +    if (!match?.id) {
 +      throw new McpError(
 +        ErrorCode.InvalidParams,
-+        \`Could not resolve user "\${upnOrId}" to an object id in tenant \${tenantFilter}.\`
++        `Could not resolve user "${upnOrId}" to an object id in tenant ${tenantFilter}.`
 +      );
 +    }
 +    return match.id;

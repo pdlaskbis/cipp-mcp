@@ -885,4 +885,180 @@ export class CippService {
     }
     return this.request<T>('GET', 'ListGraphRequest', query);
   }
+  // -------------------------------------------------------------------------
+  // Exchange write depth + BEC containment (CIPP-API 10.6.0)
+  // Added to close CIPP Daily Ops Manual coverage gaps — see
+  // pdlaskbis/cyberdrain_cipp issue #1. Endpoint names verified against the
+  // KelvinTegelaar/CIPP-API v10.6.0 tag.
+  // -------------------------------------------------------------------------
+
+  /**
+   * List inbox rules configured on a mailbox.
+   * Calls the \`ListMailboxRules\` Azure Function. CIPP populates a per-tenant
+   * cache asynchronously: the first call for a cold tenant returns a Metadata
+   * queue message ("check back in a minute") rather than rows — call again
+   * shortly after. Manual Task 5/6.
+   */
+  async listMailboxRules<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListMailboxRules', { tenantFilter });
+  }
+
+  /**
+   * Remove a single inbox rule from a mailbox.
+   * Calls the \`ExecRemoveMailboxRule\` Azure Function. \`ruleId\` is the
+   * mailbox-qualified rule identifier from listMailboxRules; CIPP derives the
+   * mailbox object id from it. Manual Task 5/6 (BEC persistence removal).
+   */
+  async removeMailboxRule<T = unknown>(
+    tenantFilter: string,
+    userPrincipalName: string,
+    ruleId: string,
+    ruleName?: string
+  ): Promise<T> {
+    const body: Record<string, unknown> = {
+      TenantFilter: tenantFilter,
+      userPrincipalName,
+      ruleId,
+    };
+    if (ruleName !== undefined) body.ruleName = ruleName;
+    return this.request<T>('POST', 'ExecRemoveMailboxRule', undefined, body);
+  }
+
+  /**
+   * Run CIPP's bundled BEC remediation sequence against a compromised account.
+   * Calls the \`ExecBECRemediate\` Azure Function, which performs, in order:
+   * reset password, disable account, revoke sessions, remove MFA methods,
+   * disable inbox rules, and disable OneDrive sharing — returning a per-step
+   * result list. \`userId\` is the Azure AD object id; \`username\` is the UPN.
+   * Manual Task 6 (full containment in one auditable call).
+   */
+  async becRemediate<T = unknown>(
+    tenantFilter: string,
+    userId: string,
+    username: string
+  ): Promise<T> {
+    return this.request<T>('POST', 'ExecBECRemediate', undefined, {
+      tenantFilter,
+      userid: userId,
+      username,
+    });
+  }
+
+  /**
+   * Add or remove mailbox delegation (FullAccess, SendAs, SendOnBehalf).
+   * Calls the \`ExecEditMailboxPermissions\` Azure Function. Each permission
+   * change is expressed as a bucket whose \`value\` is an array of delegate
+   * UPNs. \`userId\` is the target mailbox UPN. Manual Task 9.
+   */
+  async editMailboxPermissions<T = unknown>(
+    tenantFilter: string,
+    userId: string,
+    buckets: Record<string, string[]>
+  ): Promise<T> {
+    const body: Record<string, unknown> = {
+      tenantFilter,
+      userID: userId,
+    };
+    for (const [bucket, users] of Object.entries(buckets)) {
+      if (users && users.length > 0) {
+        body[bucket] = { value: users };
+      }
+    }
+    return this.request<T>('POST', 'ExecEditMailboxPermissions', undefined, body);
+  }
+
+  /**
+   * Convert a mailbox between Regular, Shared, and Room types.
+   * Calls the \`ExecConvertMailbox\` Azure Function. \`id\` is the mailbox UPN
+   * or object id. Manual Task 9 (shared-mailbox conversion).
+   */
+  async convertMailbox<T = unknown>(
+    tenantFilter: string,
+    id: string,
+    mailboxType: string
+  ): Promise<T> {
+    return this.request<T>('POST', 'ExecConvertMailbox', undefined, {
+      tenantFilter,
+      ID: id,
+      MailboxType: mailboxType,
+    });
+  }
+
+  /**
+   * Add or remove members of a group.
+   * Calls the \`EditGroup\` Azure Function. Members are passed as UPNs.
+   *
+   * Payload shape matters here. CIPP's EditGroup reads each member as
+   * \`{ value, addedFields: { userPrincipalName } }\` (the shape its own
+   * frontend sends). For a UPN we therefore leave \`value\` empty and put the
+   * UPN in \`addedFields.userPrincipalName\`:
+   *   - Add path: when \`value\` is empty CIPP does a Graph lookup of the UPN to
+   *     get the directory object id before binding it — so a UPN resolves
+   *     correctly server-side (no client-side id lookup needed).
+   *   - Remove path (security / M365 groups): CIPP builds
+   *     \`groups/{id}/members/{value}/$ref\`, which requires the object id. A
+   *     bare UPN in \`value\` would 404, so this method resolves each removal
+   *     UPN to its object id via ListUsers first. (Distribution / mail-enabled
+   *     security groups accept the UPN directly, but resolving is harmless.)
+   *
+   * Works for security, M365, distribution, and mail-enabled security groups.
+   * Manual Task 10.
+   */
+  async editGroupMembers<T = unknown>(
+    tenantFilter: string,
+    groupId: string,
+    groupType: string,
+    addMembers?: string[],
+    removeMembers?: string[]
+  ): Promise<T> {
+    const body: Record<string, unknown> = {
+      tenantFilter,
+      groupId,
+      groupType,
+    };
+    if (addMembers && addMembers.length > 0) {
+      // value empty → CIPP resolves the UPN to an object id server-side.
+      body.AddMember = addMembers.map((u) => ({
+        value: '',
+        addedFields: { userPrincipalName: u },
+      }));
+    }
+    if (removeMembers && removeMembers.length > 0) {
+      body.RemoveMember = await Promise.all(
+        removeMembers.map(async (u) => ({
+          value: await this.resolveUserObjectId(tenantFilter, u),
+          addedFields: { userPrincipalName: u },
+        }))
+      );
+    }
+    return this.request<T>('POST', 'EditGroup', undefined, body);
+  }
+
+  /**
+   * Resolve a user's Azure AD object id from a UPN via \`ListUsers\`. If the
+   * input already looks like a GUID it is returned unchanged, so callers may
+   * pass either a UPN or an object id. Throws {@link McpError} when the UPN
+   * cannot be found, rather than silently returning an unusable value.
+   */
+  private async resolveUserObjectId(tenantFilter: string, upnOrId: string): Promise<string> {
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (GUID_RE.test(upnOrId)) {
+      return upnOrId;
+    }
+    const users = await this.listUsers<Array<{ id?: string; userPrincipalName?: string }>>(
+      tenantFilter,
+      { searchField: 'userPrincipalName', searchValue: upnOrId }
+    );
+    const match = (Array.isArray(users) ? users : []).find(
+      (u) => u?.userPrincipalName?.toLowerCase() === upnOrId.toLowerCase()
+    );
+    if (!match?.id) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Could not resolve user "${upnOrId}" to an object id in tenant ${tenantFilter}.`
+      );
+    }
+    return match.id;
+  }
 }
+
