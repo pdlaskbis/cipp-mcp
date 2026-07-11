@@ -1,0 +1,557 @@
+diff --git a/src/handlers/tool.handler.ts b/src/handlers/tool.handler.ts
+index 55a207d..f7f07d3 100644
+--- a/src/handlers/tool.handler.ts
++++ b/src/handlers/tool.handler.ts
+@@ -467,6 +467,97 @@ export class CippToolHandler {
+           break;
+         }
+ 
++        case 'cipp_list_mailbox_rules': {
++          const { tenantFilter } = args as { tenantFilter: string };
++          result = await this.cippService.listMailboxRules(tenantFilter);
++          break;
++        }
++
++        case 'cipp_remove_mailbox_rule': {
++          const { tenantFilter, userPrincipalName, ruleId, ruleName } = args as {
++            tenantFilter: string;
++            userPrincipalName: string;
++            ruleId: string;
++            ruleName?: string;
++          };
++          result = await this.cippService.removeMailboxRule(
++            tenantFilter,
++            userPrincipalName,
++            ruleId,
++            ruleName
++          );
++          break;
++        }
++
++        case 'cipp_bec_remediate': {
++          const { tenantFilter, userId, username } = args as {
++            tenantFilter: string;
++            userId: string;
++            username: string;
++          };
++          result = await this.cippService.becRemediate(tenantFilter, userId, username);
++          break;
++        }
++
++        case 'cipp_edit_mailbox_permissions': {
++          const {
++            tenantFilter,
++            upn,
++            addFullAccess,
++            removeFullAccess,
++            addSendAs,
++            removeSendAs,
++            addSendOnBehalf,
++            removeSendOnBehalf,
++          } = args as {
++            tenantFilter: string;
++            upn: string;
++            addFullAccess?: string[];
++            removeFullAccess?: string[];
++            addSendAs?: string[];
++            removeSendAs?: string[];
++            addSendOnBehalf?: string[];
++            removeSendOnBehalf?: string[];
++          };
++          const buckets: Record<string, string[]> = {};
++          if (addFullAccess) buckets.AddFullAccess = addFullAccess;
++          if (removeFullAccess) buckets.RemoveFullAccess = removeFullAccess;
++          if (addSendAs) buckets.AddSendAs = addSendAs;
++          if (removeSendAs) buckets.RemoveSendAs = removeSendAs;
++          if (addSendOnBehalf) buckets.AddSendOnBehalf = addSendOnBehalf;
++          if (removeSendOnBehalf) buckets.RemoveSendOnBehalf = removeSendOnBehalf;
++          result = await this.cippService.editMailboxPermissions(tenantFilter, upn, buckets);
++          break;
++        }
++
++        case 'cipp_convert_to_shared_mailbox': {
++          const { tenantFilter, id, mailboxType } = args as {
++            tenantFilter: string;
++            id: string;
++            mailboxType: string;
++          };
++          result = await this.cippService.convertMailbox(tenantFilter, id, mailboxType);
++          break;
++        }
++
++        case 'cipp_edit_group_members': {
++          const { tenantFilter, groupId, groupType, addMembers, removeMembers } = args as {
++            tenantFilter: string;
++            groupId: string;
++            groupType: string;
++            addMembers?: string[];
++            removeMembers?: string[];
++          };
++          result = await this.cippService.editGroupMembers(
++            tenantFilter,
++            groupId,
++            groupType,
++            addMembers,
++            removeMembers
++          );
++          break;
++        }
++
+         default:
+           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+       }
+diff --git a/src/mcp/tool.definitions.ts b/src/mcp/tool.definitions.ts
+index 3069a1a..d153c5d 100644
+--- a/src/mcp/tool.definitions.ts
++++ b/src/mcp/tool.definitions.ts
+@@ -922,8 +922,243 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
+       },
+     },
+   },
++  // -------------------------------------------------------------------------
++  // Exchange write depth + BEC containment (CIPP-API 10.6.0)
++  // Closes CIPP Daily Ops Manual gaps — pdlaskbis/cyberdrain_cipp issue #1.
++  // -------------------------------------------------------------------------
++  {
++    name: 'cipp_list_mailbox_rules',
++    description:
++      'Lists the inbox rules configured on mailboxes in a tenant. Read-only. ' +
++      'Primary use is spotting malicious rule-based forwarding or message ' +
++      'hiding during compromise review (Manual Task 5/6). Note: CIPP builds ' +
++      'this data into a per-tenant cache asynchronously — a cold tenant may ' +
++      'first return a "still loading, check back in a minute" queue message ' +
++      'instead of rows; call again shortly after.',
++    annotations: {
++      title: 'List mailbox inbox rules',
++      readOnlyHint: true,
++      destructiveHint: false,
++      idempotentHint: true,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++      },
++      required: ['tenantFilter'],
++    },
++  },
++  {
++    name: 'cipp_remove_mailbox_rule',
++    description:
++      '⚠ HIGH-IMPACT. Permanently removes a single inbox rule from a mailbox. ' +
++      'Used to strip attacker-created forwarding/hiding rules during BEC ' +
++      'response (Manual Task 5/6). Not reversible — the rule must be recreated ' +
++      'by hand if removed in error. Confirm with the user before invoking.',
++    annotations: {
++      title: 'Remove mailbox inbox rule (high-impact)',
++      readOnlyHint: false,
++      destructiveHint: true,
++      idempotentHint: false,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++        userPrincipalName: {
++          type: 'string',
++          description: 'UPN of the mailbox the rule belongs to.',
++        },
++        ruleId: {
++          type: 'string',
++          description:
++            'The mailbox-qualified rule identifier as returned by cipp_list_mailbox_rules. ' +
++            'CIPP derives the mailbox object id from this value.',
++        },
++        ruleName: {
++          type: 'string',
++          description: 'Optional display name of the rule, used for logging.',
++        },
++      },
++      required: ['tenantFilter', 'userPrincipalName', 'ruleId'],
++    },
++  },
++  {
++    name: 'cipp_bec_remediate',
++    description:
++      '⚠ HIGH-IMPACT. Runs the full bundled Business Email Compromise ' +
++      'containment sequence against a suspected-compromised account, in order: ' +
++      'reset password, disable account, revoke all sessions, remove MFA ' +
++      'methods, disable inbox rules, and disable OneDrive sharing. Returns a ' +
++      'per-step result list. This is the one-call containment path for Manual ' +
++      'Task 6. Locks the user out immediately. Confirm with the user before ' +
++      'invoking, and prefer raising the Autotask Security Incident ticket and ' +
++      'preserving evidence first where time allows.',
++    annotations: {
++      title: 'BEC remediate — full containment (high-impact)',
++      readOnlyHint: false,
++      destructiveHint: true,
++      idempotentHint: false,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++        userId: {
++          type: 'string',
++          description: "The compromised user's Azure AD object id.",
++        },
++        username: {
++          type: 'string',
++          description: "The compromised user's UPN (e.g. alice@contoso.com).",
++        },
++      },
++      required: ['tenantFilter', 'userId', 'username'],
++    },
++  },
++  {
++    name: 'cipp_edit_mailbox_permissions',
++    description:
++      '⚠ HIGH-IMPACT. Adds or removes mailbox delegation — FullAccess, SendAs, ' +
++      'or SendOnBehalf — for one or more delegate users on a target mailbox ' +
++      '(Manual Task 9). Granting FullAccess or SendAs exposes another user\u2019s ' +
++      'mail, so confirm with the user before invoking. Reversible by applying ' +
++      'the opposite operation.',
++    annotations: {
++      title: 'Edit mailbox permissions (high-impact)',
++      readOnlyHint: false,
++      destructiveHint: true,
++      idempotentHint: true,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++        upn: {
++          type: 'string',
++          description: 'UPN of the target mailbox whose permissions are being changed.',
++        },
++        addFullAccess: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to grant FullAccess (auto-mapping enabled).',
++        },
++        removeFullAccess: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to remove FullAccess from.',
++        },
++        addSendAs: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to grant SendAs.',
++        },
++        removeSendAs: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to remove SendAs from.',
++        },
++        addSendOnBehalf: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to grant SendOnBehalf.',
++        },
++        removeSendOnBehalf: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'Delegate UPNs to remove SendOnBehalf from.',
++        },
++      },
++      required: ['tenantFilter', 'upn'],
++    },
++  },
++  {
++    name: 'cipp_convert_to_shared_mailbox',
++    description:
++      '⚠ HIGH-IMPACT. Converts a mailbox between Regular, Shared, and Room ' +
++      'types (Manual Task 9). Converting a licensed user mailbox to Shared is ' +
++      'a common offboarding step so the mailbox can be retained without a ' +
++      'license (under 50 GB). Reversible by converting back. Confirm with the ' +
++      'user before invoking.',
++    annotations: {
++      title: 'Convert mailbox type (high-impact)',
++      readOnlyHint: false,
++      destructiveHint: true,
++      idempotentHint: true,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++        id: {
++          type: 'string',
++          description: 'UPN or object id of the mailbox to convert.',
++        },
++        mailboxType: {
++          type: 'string',
++          enum: ['Regular', 'Shared', 'Room'],
++          description: 'Target mailbox type.',
++        },
++      },
++      required: ['tenantFilter', 'id', 'mailboxType'],
++    },
++  },
++  {
++    name: 'cipp_edit_group_members',
++    description:
++      '⚠ HIGH-IMPACT. Adds or removes members of a group (Manual Task 10). ' +
++      'Works for Security, Microsoft 365, Distribution, and Mail-Enabled ' +
++      'Security groups. Because security-group membership can drive Conditional ' +
++      'Access and license assignment, changes here can have broad downstream ' +
++      'effect. Reversible by the opposite operation. Confirm before invoking.',
++    annotations: {
++      title: 'Edit group members (high-impact)',
++      readOnlyHint: false,
++      destructiveHint: true,
++      idempotentHint: true,
++      openWorldHint: true,
++    },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        tenantFilter: TENANT_FILTER_PROP,
++        groupId: {
++          type: 'string',
++          description: 'The object id of the group to modify.',
++        },
++        groupType: {
++          type: 'string',
++          enum: [
++            'Security',
++            'Microsoft 365',
++            'Distribution List',
++            'Mail-Enabled Security',
++          ],
++          description:
++            'The group type. Determines whether membership is changed via Graph ' +
++            '(security / M365) or Exchange (distribution / mail-enabled security).',
++        },
++        addMembers: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'UPNs of users to add to the group.',
++        },
++        removeMembers: {
++          type: 'array',
++          items: { type: 'string' },
++          description: 'UPNs of users to remove from the group.',
++        },
++      },
++      required: ['tenantFilter', 'groupId', 'groupType'],
++    },
++  },
+ ];
+-
+ // ---------------------------------------------------------------------------
+ // Tool Categories
+ // ---------------------------------------------------------------------------
+@@ -944,14 +1179,19 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
+     'cipp_revoke_sessions',
+     'cipp_offboard_user',
+     'cipp_bec_check',
++    'cipp_bec_remediate',
+     'cipp_list_mfa_users',
+     'cipp_list_user_devices',
+     'cipp_list_user_groups',
+   ],
+-  groups: ['cipp_list_groups', 'cipp_create_group'],
++  groups: ['cipp_list_groups', 'cipp_create_group', 'cipp_edit_group_members'],
+   mailboxes: [
+     'cipp_list_mailboxes',
+     'cipp_list_mailbox_permissions',
++    'cipp_edit_mailbox_permissions',
++    'cipp_convert_to_shared_mailbox',
++    'cipp_list_mailbox_rules',
++    'cipp_remove_mailbox_rule',
+     'cipp_set_out_of_office',
+     'cipp_set_email_forwarding',
+   ],
+diff --git a/src/services/cipp.service.ts b/src/services/cipp.service.ts
+index 35d8633..31dd598 100644
+--- a/src/services/cipp.service.ts
++++ b/src/services/cipp.service.ts
+@@ -885,4 +885,180 @@ export class CippService {
+     }
+     return this.request<T>('GET', 'ListGraphRequest', query);
+   }
++  // -------------------------------------------------------------------------
++  // Exchange write depth + BEC containment (CIPP-API 10.6.0)
++  // Added to close CIPP Daily Ops Manual coverage gaps — see
++  // pdlaskbis/cyberdrain_cipp issue #1. Endpoint names verified against the
++  // KelvinTegelaar/CIPP-API v10.6.0 tag.
++  // -------------------------------------------------------------------------
++
++  /**
++   * List inbox rules configured on a mailbox.
++   * Calls the \`ListMailboxRules\` Azure Function. CIPP populates a per-tenant
++   * cache asynchronously: the first call for a cold tenant returns a Metadata
++   * queue message ("check back in a minute") rather than rows — call again
++   * shortly after. Manual Task 5/6.
++   */
++  async listMailboxRules<T = unknown>(tenantFilter: string): Promise<T> {
++    return this.request<T>('GET', 'ListMailboxRules', { tenantFilter });
++  }
++
++  /**
++   * Remove a single inbox rule from a mailbox.
++   * Calls the \`ExecRemoveMailboxRule\` Azure Function. \`ruleId\` is the
++   * mailbox-qualified rule identifier from listMailboxRules; CIPP derives the
++   * mailbox object id from it. Manual Task 5/6 (BEC persistence removal).
++   */
++  async removeMailboxRule<T = unknown>(
++    tenantFilter: string,
++    userPrincipalName: string,
++    ruleId: string,
++    ruleName?: string
++  ): Promise<T> {
++    const body: Record<string, unknown> = {
++      TenantFilter: tenantFilter,
++      userPrincipalName,
++      ruleId,
++    };
++    if (ruleName !== undefined) body.ruleName = ruleName;
++    return this.request<T>('POST', 'ExecRemoveMailboxRule', undefined, body);
++  }
++
++  /**
++   * Run CIPP's bundled BEC remediation sequence against a compromised account.
++   * Calls the \`ExecBECRemediate\` Azure Function, which performs, in order:
++   * reset password, disable account, revoke sessions, remove MFA methods,
++   * disable inbox rules, and disable OneDrive sharing — returning a per-step
++   * result list. \`userId\` is the Azure AD object id; \`username\` is the UPN.
++   * Manual Task 6 (full containment in one auditable call).
++   */
++  async becRemediate<T = unknown>(
++    tenantFilter: string,
++    userId: string,
++    username: string
++  ): Promise<T> {
++    return this.request<T>('POST', 'ExecBECRemediate', undefined, {
++      tenantFilter,
++      userid: userId,
++      username,
++    });
++  }
++
++  /**
++   * Add or remove mailbox delegation (FullAccess, SendAs, SendOnBehalf).
++   * Calls the \`ExecEditMailboxPermissions\` Azure Function. Each permission
++   * change is expressed as a bucket whose \`value\` is an array of delegate
++   * UPNs. \`userId\` is the target mailbox UPN. Manual Task 9.
++   */
++  async editMailboxPermissions<T = unknown>(
++    tenantFilter: string,
++    userId: string,
++    buckets: Record<string, string[]>
++  ): Promise<T> {
++    const body: Record<string, unknown> = {
++      tenantFilter,
++      userID: userId,
++    };
++    for (const [bucket, users] of Object.entries(buckets)) {
++      if (users && users.length > 0) {
++        body[bucket] = { value: users };
++      }
++    }
++    return this.request<T>('POST', 'ExecEditMailboxPermissions', undefined, body);
++  }
++
++  /**
++   * Convert a mailbox between Regular, Shared, and Room types.
++   * Calls the \`ExecConvertMailbox\` Azure Function. \`id\` is the mailbox UPN
++   * or object id. Manual Task 9 (shared-mailbox conversion).
++   */
++  async convertMailbox<T = unknown>(
++    tenantFilter: string,
++    id: string,
++    mailboxType: string
++  ): Promise<T> {
++    return this.request<T>('POST', 'ExecConvertMailbox', undefined, {
++      tenantFilter,
++      ID: id,
++      MailboxType: mailboxType,
++    });
++  }
++
++  /**
++   * Add or remove members of a group.
++   * Calls the \`EditGroup\` Azure Function. Members are passed as UPNs.
++   *
++   * Payload shape matters here. CIPP's EditGroup reads each member as
++   * \`{ value, addedFields: { userPrincipalName } }\` (the shape its own
++   * frontend sends). For a UPN we therefore leave \`value\` empty and put the
++   * UPN in \`addedFields.userPrincipalName\`:
++   *   - Add path: when \`value\` is empty CIPP does a Graph lookup of the UPN to
++   *     get the directory object id before binding it — so a UPN resolves
++   *     correctly server-side (no client-side id lookup needed).
++   *   - Remove path (security / M365 groups): CIPP builds
++   *     \`groups/{id}/members/{value}/$ref\`, which requires the object id. A
++   *     bare UPN in \`value\` would 404, so this method resolves each removal
++   *     UPN to its object id via ListUsers first. (Distribution / mail-enabled
++   *     security groups accept the UPN directly, but resolving is harmless.)
++   *
++   * Works for security, M365, distribution, and mail-enabled security groups.
++   * Manual Task 10.
++   */
++  async editGroupMembers<T = unknown>(
++    tenantFilter: string,
++    groupId: string,
++    groupType: string,
++    addMembers?: string[],
++    removeMembers?: string[]
++  ): Promise<T> {
++    const body: Record<string, unknown> = {
++      tenantFilter,
++      groupId,
++      groupType,
++    };
++    if (addMembers && addMembers.length > 0) {
++      // value empty → CIPP resolves the UPN to an object id server-side.
++      body.AddMember = addMembers.map((u) => ({
++        value: '',
++        addedFields: { userPrincipalName: u },
++      }));
++    }
++    if (removeMembers && removeMembers.length > 0) {
++      body.RemoveMember = await Promise.all(
++        removeMembers.map(async (u) => ({
++          value: await this.resolveUserObjectId(tenantFilter, u),
++          addedFields: { userPrincipalName: u },
++        }))
++      );
++    }
++    return this.request<T>('POST', 'EditGroup', undefined, body);
++  }
++
++  /**
++   * Resolve a user's Azure AD object id from a UPN via \`ListUsers\`. If the
++   * input already looks like a GUID it is returned unchanged, so callers may
++   * pass either a UPN or an object id. Throws {@link McpError} when the UPN
++   * cannot be found, rather than silently returning an unusable value.
++   */
++  private async resolveUserObjectId(tenantFilter: string, upnOrId: string): Promise<string> {
++    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++    if (GUID_RE.test(upnOrId)) {
++      return upnOrId;
++    }
++    const users = await this.listUsers<Array<{ id?: string; userPrincipalName?: string }>>(
++      tenantFilter,
++      { searchField: 'userPrincipalName', searchValue: upnOrId }
++    );
++    const match = (Array.isArray(users) ? users : []).find(
++      (u) => u?.userPrincipalName?.toLowerCase() === upnOrId.toLowerCase()
++    );
++    if (!match?.id) {
++      throw new McpError(
++        ErrorCode.InvalidParams,
++        \`Could not resolve user "\${upnOrId}" to an object id in tenant \${tenantFilter}.\`
++      );
++    }
++    return match.id;
++  }
+ }
++
