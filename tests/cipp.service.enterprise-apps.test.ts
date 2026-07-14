@@ -29,15 +29,35 @@ describe('CippService enterprise apps tooling', () => {
     jest.restoreAllMocks();
   });
 
-  it('listEnterpriseApps GETs ListGraphRequest with tenantFilter + /servicePrincipals endpoint + third-party filter by default', async () => {
+  it('listEnterpriseApps GETs ListGraphRequest with tenantFilter + /servicePrincipals endpoint and filters built-ins client-side by default', async () => {
     const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([{ appId: 'a1', displayName: 'Slack' }]))
+      () =>
+        Promise.resolve(
+          jsonResponse({
+            Results: [
+              {
+                appId: 'a1',
+                displayName: 'Slack',
+                appOwnerOrganizationId: '11111111-1111-1111-1111-111111111111',
+              },
+              {
+                appId: 'a2',
+                displayName: 'Microsoft App',
+                appOwnerOrganizationId: 'f8cdef31-a31e-4b4a-93e4-5f571e91255a',
+              },
+            ],
+          })
+        )
     );
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    const result = await svc.listEnterpriseApps('contoso.com');
+    const result = (await svc.listEnterpriseApps('contoso.com')) as {
+      Results: Array<{ appId: string; displayName: string }>;
+    };
 
-    expect(result).toEqual([{ appId: 'a1', displayName: 'Slack' }]);
+    expect(result.Results).toEqual([
+      expect.objectContaining({ appId: 'a1', displayName: 'Slack' }),
+    ]);
     const [url, init] = fetchMock.mock.calls[0];
     const parsed = new URL(url);
     expect(parsed.pathname).toMatch(/\/api\/ListGraphRequest$/);
@@ -47,24 +67,43 @@ describe('CippService enterprise apps tooling', () => {
     expect(parsed.searchParams.get('$select')).toBe(
       'appId,displayName,publisherName,appOwnerOrganizationId,signInAudience,tags,createdDateTime'
     );
-    // Default third-party filter — exclude Microsoft built-in (owner org f8cdef31-…)
-    expect(parsed.searchParams.get('$filter')).toBe(
-      'appOwnerOrganizationId ne f8cdef31-a31e-4b4a-93e4-5f571e91255a'
-    );
+    expect(parsed.searchParams.has('$filter')).toBe(false);
   });
 
-  it('listEnterpriseApps omits $filter when includeBuiltIn=true', async () => {
+  it('listEnterpriseApps keeps built-ins when includeBuiltIn=true', async () => {
     const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([]))
+      () =>
+        Promise.resolve(
+          jsonResponse({
+            Results: [
+              {
+                appId: 'a1',
+                displayName: 'Slack',
+                appOwnerOrganizationId: '11111111-1111-1111-1111-111111111111',
+              },
+              {
+                appId: 'a2',
+                displayName: 'Microsoft App',
+                appOwnerOrganizationId: 'f8cdef31-a31e-4b4a-93e4-5f571e91255a',
+              },
+            ],
+          })
+        )
     );
     global.fetch = fetchMock as unknown as typeof fetch;
 
-    await svc.listEnterpriseApps('contoso.com', { includeBuiltIn: true });
+    const result = (await svc.listEnterpriseApps('contoso.com', {
+      includeBuiltIn: true,
+    })) as { Results: Array<{ appId: string; displayName: string }> };
 
     const [url] = fetchMock.mock.calls[0];
     const parsed = new URL(url);
     expect(parsed.searchParams.has('$filter')).toBe(false);
     expect(parsed.searchParams.get('Endpoint')).toBe('/servicePrincipals');
+    expect(result.Results).toEqual([
+      expect.objectContaining({ appId: 'a1', displayName: 'Slack' }),
+      expect.objectContaining({ appId: 'a2', displayName: 'Microsoft App' }),
+    ]);
   });
 
   it('listEnterpriseApps passes tenantFilter=allTenants through for CIPP-side fan-out', async () => {
