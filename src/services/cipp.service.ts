@@ -880,10 +880,21 @@ export class CippService {
       $select:
         'appId,displayName,publisherName,appOwnerOrganizationId,signInAudience,tags,createdDateTime',
     };
-    if (!params?.includeBuiltIn) {
-      query.$filter = `appOwnerOrganizationId ne ${MICROSOFT_OWNER_ORG_ID}`;
+    // Graph's /servicePrincipals rejects the `ne` operator unless the request is
+    // an advanced query ($count=true + ConsistencyLevel: eventual), which CIPP's
+    // ListGraphRequest passthrough doesn't set -> HTTP 400 ("Filter operator
+    // 'NotEqualsMatch' is not supported"). Fetch unfiltered, exclude Microsoft
+    // built-ins client-side.
+    const response = await this.request<{
+      Results?: Array<{ appOwnerOrganizationId?: string }>;
+    }>('GET', 'ListGraphRequest', query);
+
+    if (!params?.includeBuiltIn && response && Array.isArray(response.Results)) {
+      response.Results = response.Results.filter(
+        (sp) => sp?.appOwnerOrganizationId !== MICROSOFT_OWNER_ORG_ID
+      );
     }
-    return this.request<T>('GET', 'ListGraphRequest', query);
+    return response as T;
   }
   // -------------------------------------------------------------------------
   // Exchange write depth + BEC containment (CIPP-API 10.6.0)
