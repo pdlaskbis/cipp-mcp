@@ -215,8 +215,12 @@ export class CippToolHandler {
         // Groups
         // -----------------------------------------------------------------------
         case 'cipp_list_groups': {
-          const { tenantFilter, search } = args as { tenantFilter: string; search?: string };
-          result = await this.cippService.listGroups(tenantFilter, { search });
+          const { tenantFilter, search, useReportDB } = args as {
+            tenantFilter: string;
+            search?: string;
+            useReportDB?: boolean;
+          };
+          result = await this.cippService.listGroups(tenantFilter, { search, useReportDB });
           break;
         }
 

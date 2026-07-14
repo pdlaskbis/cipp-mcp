@@ -408,6 +408,11 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           description:
             'Optional text to filter results by group display name. Partial matches are supported.',
         },
+        useReportDB: {
+          type: 'boolean',
+          description:
+            'Optional CIPP flag to read from the reporting database cache for faster group listings.',
+        },
       },
       required: ['tenantFilter'],
     },
