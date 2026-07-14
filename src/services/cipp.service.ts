@@ -330,7 +330,45 @@ export class CippService {
     tenantFilter: string,
     userData: Record<string, unknown>
   ): Promise<T> {
-    return this.request<T>('POST', 'AddUser', undefined, { tenantFilter, ...userData });
+    const submission = await this.request<Record<string, unknown>>(
+      'POST',
+      'AddUser',
+      undefined,
+      { tenantFilter, ...userData }
+    );
+
+    // CIPP's AddUser returns an accepted ack before the object necessarily
+    // exists - a bare 200 does NOT prove creation. Verify by reading the user
+    // back so a tech never tells a caller "you're set" for an account that
+    // never landed.
+    const upn =
+      typeof userData.userPrincipalName === 'string' ? userData.userPrincipalName : undefined;
+
+    let verified = false;
+    if (upn) {
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const users = await this.listUsers<Array<{ userPrincipalName?: string }>>(
+          tenantFilter,
+          { searchField: 'userPrincipalName', searchValue: upn }
+        );
+        verified = (Array.isArray(users) ? users : []).some(
+          (u) => u?.userPrincipalName?.toLowerCase() === upn.toLowerCase()
+        );
+        if (verified) break;
+        await new Promise((resolve) => setTimeout(resolve, 10_000));
+      }
+    }
+
+    return {
+      status: verified ? 'created' : 'pending',
+      verified,
+      userPrincipalName: upn,
+      message: verified
+        ? `User ${upn} confirmed present in ${tenantFilter}.`
+        : `CIPP accepted AddUser for ${upn ?? '(unknown UPN)'} but the account was not visible in ${tenantFilter} within the verification window. Do NOT report success - re-check with cipp_list_users before confirming.`,
+      submission,
+    } as T;
   }
 
   /**
