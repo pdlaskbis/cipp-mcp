@@ -35,6 +35,15 @@ export interface DomainHealthCheck {
   dkim: unknown;
 }
 
+export type CippGroupType =
+  | 'Generic'
+  | 'Security'
+  | 'M365'
+  | 'Distribution'
+  | 'DynamicDistribution'
+  | 'AzureRole'
+  | 'Dynamic';
+
 /**
  * Per-check timeout (ms) for `ListDomainHealth` DNS lookups. Each check
  * resolves DNS server-side at CIPP and can be slow; bounding each one keeps
@@ -445,12 +454,20 @@ export class CippService {
    *
    * @param tenantFilter - Tenant domain or identifier.
    * @param userId       - Azure AD object ID of the user.
+   * @param username     - Optional UPN for CIPP's confirmation/audit string.
    */
-  async revokeSessions<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecRevokeSessions', undefined, {
-      tenantFilter,
-      ID: userId,
-    });
+  async revokeSessions<T = unknown>(
+    tenantFilter: string,
+    userId: string,
+    username?: string
+  ): Promise<T> {
+    // CIPP builds its confirmation string from Body.Username; without it a
+    // successful revoke returns "Successfully revoked sessions for " (blank),
+    // which reads as failure. Fall back to userId when it's already a UPN.
+    const resolvedUsername = username ?? (userId.includes('@') ? userId : undefined);
+    const body: Record<string, unknown> = { tenantFilter, ID: userId };
+    if (resolvedUsername) body.Username = resolvedUsername;
+    return this.request<T>('POST', 'ExecRevokeSessions', undefined, body);
   }
 
   /**
@@ -536,17 +553,53 @@ export class CippService {
   }
 
   /**
-   * Create a new Azure AD group in a tenant.
-   * Calls the `AddGroup` Azure Function.
+   * Create a new group in a tenant. Calls the `AddGroup` Azure Function.
    *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param groupData    - Group properties (displayName, groupType, etc.).
+   * Payload shape matters here. CIPP's New-CIPPGroup does
+   * `$GroupObject.groupType.ToLower()`, so a missing groupType throws
+   * "You cannot call a method on a null-valued expression" as an HTTP 500.
+   * CIPP derives securityEnabled / mailEnabled / mailNickname itself from
+   * groupType, so sending Graph-style booleans is ignored.
+   *
+   * Note CIPP's naming: a plain Entra security group is `Generic`. `Security`
+   * means a mail-enabled security group created via Exchange.
    */
   async createGroup<T = unknown>(
     tenantFilter: string,
-    groupData: Record<string, unknown>
+    groupData: {
+      displayName: string;
+      groupType: CippGroupType;
+      username?: string;
+      description?: string;
+      primDomain?: string;
+    }
   ): Promise<T> {
-    return this.request<T>('POST', 'AddGroup', undefined, { tenantFilter, ...groupData });
+    if (!groupData.groupType) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'groupType is required. CIPP\'s New-CIPPGroup calls groupType.ToLower() and returns HTTP 500 "You cannot call a method on a null-valued expression" without it.'
+      );
+    }
+
+    const NEEDS_EMAIL: CippGroupType[] = ['M365', 'Distribution', 'DynamicDistribution', 'Security'];
+    if (NEEDS_EMAIL.includes(groupData.groupType) && !groupData.username) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `groupType "${groupData.groupType}" is mail-enabled and requires "username" (the mail alias / local part of the group address).`
+      );
+    }
+
+    const body: Record<string, unknown> = {
+      tenantFilter,
+      displayName: groupData.displayName,
+      groupType: groupData.groupType,
+    };
+    if (groupData.description !== undefined) body.description = groupData.description;
+    if (groupData.username !== undefined) body.username = groupData.username;
+    // CIPP reads this as $GroupObject.primDomain.value.
+    if (groupData.primDomain !== undefined) body.primDomain = { value: groupData.primDomain };
+
+    return this.request<T>('POST', 'AddGroup', undefined, body);
   }
 
   // -------------------------------------------------------------------------

@@ -153,8 +153,12 @@ export class CippToolHandler {
         }
 
         case 'cipp_revoke_sessions': {
-          const { tenantFilter, userId } = args as { tenantFilter: string; userId: string };
-          result = await this.cippService.revokeSessions(tenantFilter, userId);
+          const { tenantFilter, userId, username } = args as {
+            tenantFilter: string;
+            userId: string;
+            username?: string;
+          };
+          result = await this.cippService.revokeSessions(tenantFilter, userId, username);
           break;
         }
 
@@ -220,23 +224,28 @@ export class CippToolHandler {
           const {
             tenantFilter,
             displayName,
+            groupType,
+            username,
+            primDomain,
             description,
-            securityEnabled,
-            mailEnabled,
-            mailNickname,
           } = args as {
             tenantFilter: string;
             displayName: string;
+            groupType: 'Generic' | 'Security' | 'M365' | 'Distribution' | 'DynamicDistribution' | 'AzureRole' | 'Dynamic';
+            username?: string;
+            primDomain?: string;
             description?: string;
-            securityEnabled?: boolean;
-            mailEnabled?: boolean;
-            mailNickname?: string;
           };
-          const groupData: Record<string, unknown> = { displayName };
+          const groupData = { displayName, groupType } as {
+            displayName: string;
+            groupType: 'Generic' | 'Security' | 'M365' | 'Distribution' | 'DynamicDistribution' | 'AzureRole' | 'Dynamic';
+            username?: string;
+            primDomain?: string;
+            description?: string;
+          };
+          if (username !== undefined) groupData.username = username;
+          if (primDomain !== undefined) groupData.primDomain = primDomain;
           if (description !== undefined) groupData.description = description;
-          if (securityEnabled !== undefined) groupData.securityEnabled = securityEnabled;
-          if (mailEnabled !== undefined) groupData.mailEnabled = mailEnabled;
-          if (mailNickname !== undefined) groupData.mailNickname = mailNickname;
           result = await this.cippService.createGroup(tenantFilter, groupData);
           break;
         }
