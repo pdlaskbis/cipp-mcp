@@ -544,12 +544,31 @@ export class CippService {
    * @param tenantFilter - Tenant domain or identifier.
    * @param params       - Optional search parameters.
    * @param params.search - Free-text search string to filter groups.
+   * @param params.useReportDB - Optional CIPP cache toggle for faster reads.
    */
   async listGroups<T = unknown>(
     tenantFilter: string,
-    params?: { search?: string }
+    params?: { search?: string; useReportDB?: boolean }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListGroups', { tenantFilter, ...params });
+    const payload = await this.request<unknown>('GET', 'ListGroups', {
+      tenantFilter,
+      ...(params?.useReportDB !== undefined ? { UseReportDB: params.useReportDB } : {}),
+    });
+
+    const search = params?.search?.trim();
+    if (!search) {
+      return payload as T;
+    }
+    if (!Array.isArray(payload)) {
+      return payload as T;
+    }
+
+    const needle = search.toLowerCase();
+    const filtered = payload.filter((row) => {
+      const displayName = (row as { displayName?: unknown })?.displayName;
+      return typeof displayName === 'string' && displayName.toLowerCase().includes(needle);
+    });
+    return filtered as T;
   }
 
   /**

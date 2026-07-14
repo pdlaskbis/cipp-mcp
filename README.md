@@ -163,3 +163,9 @@ Apache-2.0 — see [LICENSE](LICENSE)
 ## Contributing
 
 Issues and PRs welcome. This server is tracked against [wyre-technology/msp-claude-plugins#24](https://github.com/wyre-technology/msp-claude-plugins/issues/24).
+
+Before changing any CIPP integration method, run a payload preflight against the
+upstream CIPP source in `KelvinTegelaar/CIPP-API`: open the matching `Invoke-*.ps1`
+entrypoint and compare its `$Request.Query.*` / `$Request.Body.*` reads with what
+this server sends. If names differ, fix the payload shape first (or add explicit
+client-side fallback behavior when the upstream endpoint has no server-side filter).
