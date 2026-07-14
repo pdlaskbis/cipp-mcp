@@ -294,6 +294,11 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
         userId: USER_ID_PROP,
+        username: {
+          type: 'string',
+          description:
+            "Optional UPN used for CIPP's audit/confirmation string. If omitted, cipp-mcp infers it when userId is already a UPN.",
+        },
       },
       required: ['tenantFilter', 'userId'],
     },
@@ -428,27 +433,28 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           type: 'string',
           description: 'Human-readable name for the new group.',
         },
+        groupType: {
+          type: 'string',
+          enum: ['Generic', 'Security', 'M365', 'Distribution', 'DynamicDistribution', 'AzureRole', 'Dynamic'],
+          description:
+            'Generic = plain Entra security group. Security = MAIL-ENABLED security group (Exchange). M365 = unified group. Distribution = distribution list. AzureRole = role-assignable. For an ordinary security group use Generic, not Security.',
+        },
+        username: {
+          type: 'string',
+          description:
+            'Mail alias / local part for group address (e.g. finance-team). Required for M365, Distribution, DynamicDistribution, and Security group types.',
+        },
+        primDomain: {
+          type: 'string',
+          description:
+            'Optional domain for the group email address. Defaults to the tenant domain when omitted.',
+        },
         description: {
           type: 'string',
           description: 'Optional free-text description of the group purpose.',
         },
-        securityEnabled: {
-          type: 'boolean',
-          description:
-            'When true, the group can be used for security policy assignments (RBAC, Conditional Access, etc.).',
-        },
-        mailEnabled: {
-          type: 'boolean',
-          description:
-            'When true, the group is mail-enabled and can receive email. Required for Microsoft 365 groups.',
-        },
-        mailNickname: {
-          type: 'string',
-          description:
-            'The mail alias used as the local part of the group email address (e.g. "finance-team" for finance-team@contoso.com). Required when mailEnabled is true.',
-        },
       },
-      required: ['tenantFilter', 'displayName'],
+      required: ['tenantFilter', 'displayName', 'groupType'],
     },
   },
 
