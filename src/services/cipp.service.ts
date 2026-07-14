@@ -206,6 +206,38 @@ export class CippService {
     }
   }
 
+  /**
+   * Poll a CIPP list endpoint that builds its per-tenant cache asynchronously.
+   * A cold tenant first returns { Metadata: { QueueMessage, QueueId }, Results: [] }.
+   * Re-issue the same idempotent GET (re-reading the now-warming cache) a couple
+   * of times, then return whatever we have. If still queued at the deadline the
+   * Metadata fields are preserved so the caller surfaces an honest "still
+   * building, retry" instead of a misleading empty result. Wait is kept short so
+   * it never outlives the MCP gateway tool-call deadline - long builds are the
+   * caller's retry, not a block here.
+   */
+  private async getWithQueueResolution<T>(
+    path: string,
+    params: Record<string, unknown>,
+    { maxWaitMs = 30_000, intervalMs = 12_000 }: { maxWaitMs?: number; intervalMs?: number } = {}
+  ): Promise<T> {
+    type QueueEnvelope = {
+      Metadata?: { QueueMessage?: string; QueueId?: string };
+      Results?: unknown[];
+    };
+    const isQueued = (r: QueueEnvelope | undefined): boolean =>
+      Boolean(r?.Metadata?.QueueMessage || r?.Metadata?.QueueId) &&
+      (!Array.isArray(r?.Results) || r.Results.length === 0);
+
+    const deadline = Date.now() + maxWaitMs;
+    let res = await this.request<QueueEnvelope>('GET', path, params);
+    while (isQueued(res) && Date.now() + intervalMs < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      res = await this.request<QueueEnvelope>('GET', path, params);
+    }
+    return res as T;
+  }
+
   // -------------------------------------------------------------------------
   // Core
   // -------------------------------------------------------------------------
@@ -911,7 +943,7 @@ export class CippService {
    * shortly after. Manual Task 5/6.
    */
   async listMailboxRules<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ListMailboxRules', { tenantFilter });
+    return this.getWithQueueResolution<T>('ListMailboxRules', { tenantFilter });
   }
 
   /**
