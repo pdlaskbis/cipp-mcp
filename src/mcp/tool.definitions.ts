@@ -134,7 +134,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
         userPrincipalName: {
           type: 'string',
           description:
-            "The user's sign-in address / UPN (e.g. alice@contoso.com). Must be unique within the tenant.",
+            "The user's sign-in address / UPN (e.g. alice@contoso.com). CIPP splits this into username + Domain, so the domain must be a verified tenant domain and the value must be unique within the tenant.",
         },
         password: {
           type: 'string',
