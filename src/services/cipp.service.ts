@@ -339,11 +339,32 @@ export class CippService {
     tenantFilter: string,
     userData: Record<string, unknown>
   ): Promise<T> {
+    // CIPP's New-CippUser builds the UPN itself:
+    //   $UserPrincipalName = "$($UserObj.username)@$($UserObj.Domain ? $UserObj.Domain : $UserObj.PrimDomain.value)"
+    // It never reads a userPrincipalName field. Sending only userPrincipalName
+    // makes CIPP build "@" and return HTTP 500 "The domain portion of the
+    // userPrincipalName property is invalid." Split the UPN into the halves CIPP
+    // actually consumes (username + Domain). Domain is a plain string; CIPP checks
+    // it before PrimDomain.value, so it needs no { value } wrapper.
+    const rawUpn =
+      typeof userData.userPrincipalName === 'string' ? userData.userPrincipalName : undefined;
+    if (!rawUpn || !rawUpn.includes('@')) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'userPrincipalName must be a full UPN (e.g. alice@contoso.com). CIPP builds the UPN as "<username>@<Domain>" and returns HTTP 500 "The domain portion of the userPrincipalName property is invalid" if either half is missing.'
+      );
+    }
+    const atIndex = rawUpn.lastIndexOf('@');
+    const username = rawUpn.slice(0, atIndex);
+    const domain = rawUpn.slice(atIndex + 1);
+
+    // Drop userPrincipalName from the wire body; keep every other field CIPP reads.
+    const { userPrincipalName: _upn, ...passthrough } = userData;
     const submission = await this.request<Record<string, unknown>>(
       'POST',
       'AddUser',
       undefined,
-      { tenantFilter, ...userData }
+      { tenantFilter, username, Domain: domain, ...passthrough }
     );
 
     // CIPP's AddUser returns an accepted ack before the object necessarily
