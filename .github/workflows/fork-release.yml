@@ -1,0 +1,38 @@
+name: Fork Release
+
+# Self-contained semantic-release for pdlaskbis/cipp-mcp.
+# The inherited release.yml calls wyre-technology/.github reusable workflows +
+# GHCR and has never been registered/run on this fork; no tags exist. This runs
+# semantic-release directly against .releaserc.json. No GHCR, no org secrets:
+# .releaserc.json sets npmPublish:false, so the built-in GITHUB_TOKEN suffices.
+# Tags + GitHub Releases only — enough to pin Docker builds to a tag.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
