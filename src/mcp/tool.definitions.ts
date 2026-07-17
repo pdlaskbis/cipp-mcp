@@ -171,7 +171,8 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     description:
       "⚠ HIGH-IMPACT. Edits an existing user's properties, which can include " +
       'directory attributes, usage location, and may grant or revoke roles or ' +
-      'license eligibility. Reversible by editing again. ' +
+      "license eligibility. Each edit resolves and re-writes the account's current UPN, " +
+      'so a wrong userId cannot silently rename someone - it throws instead. Reversible by editing again. ' +
       'Confirm with the user before invoking.',
     annotations: {
       title: 'Edit user (high-impact)',
@@ -204,6 +205,17 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           type: 'string',
           description:
             "Two-letter ISO 3166-1 alpha-2 country code for license assignment eligibility (e.g. 'US'). Required before assigning most Microsoft 365 licences.",
+        },
+        licenses: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            "Microsoft 365 SKU IDs (GUIDs) the user should end up with. Source them from cipp_list_licenses. This REPLACES the current license set: any currently-assigned SKU not in this list is removed. usageLocation must already be set, or be sent in this same call (CIPP writes the profile before touching licenses). Omit to leave licenses untouched.",
+        },
+        removeLicenses: {
+          type: 'boolean',
+          description:
+            'When true, removes EVERY license currently assigned to the user. Mutually exclusive with `licenses`.',
         },
       },
       required: ['tenantFilter', 'userId'],
