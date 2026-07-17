@@ -117,9 +117,8 @@ describe('CippService editUser', () => {
       svc.editUser('contoso.com', '11111111-1111-1111-1111-111111111111', { displayName: 'Alice Smith' })
     ).rejects.toBeInstanceOf(McpError);
 
-    expect(fetchMock.mock.calls.some(([u, init]) => u.includes('/api/EditUser') || init.method === 'PATCH')).toBe(
-      false
-    );
+    expect(fetchMock.mock.calls.some(([u]) => u.includes('/api/EditUser'))).toBe(false);
+    expect(fetchMock.mock.calls.filter(([, init]) => init.method === 'PATCH')).toHaveLength(0);
   });
 
   it('passes usageLocation as a bare string', async () => {
