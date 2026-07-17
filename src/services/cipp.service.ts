@@ -402,23 +402,66 @@ export class CippService {
   }
 
   /**
-   * Update properties of an existing user.
+   * Update properties of an existing user, and optionally its licenses.
    * Calls the `EditUser` Azure Function.
    *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to update.
-   * @param userData     - User properties to update.
+   * @param tenantFilter   - Tenant domain or identifier.
+   * @param userId         - Object id or UPN of the user to update.
+   * @param userData       - Profile properties to update.
+   * @param licenseOptions - Optional license add/replace/remove.
    */
   async editUser<T = unknown>(
     tenantFilter: string,
     userId: string,
-    userData: Record<string, unknown>
+    userData: Record<string, unknown>,
+    licenseOptions?: { licenses?: string[]; removeLicenses?: boolean }
   ): Promise<T> {
-    return this.request<T>('PATCH', 'EditUser', undefined, {
+    const identity = await this.resolveUserIdentity(tenantFilter, userId);
+
+    const body: Record<string, unknown> = {
       tenantFilter,
-      id: userId,
+      id: identity.id,
+      username: identity.username,
+      Domain: identity.domain,
       ...userData,
-    });
+    };
+
+    // CIPP's Set-CIPPUser also rewrites mailNickname to username, always writes
+    // passwordProfile.forceChangePasswordNextSignIn (defaulting false on null),
+    // and applies the profile write before any license changes. Mirror the
+    // required identity fields; do not try to suppress that server-side behavior.
+    if (licenseOptions?.licenses && licenseOptions.licenses.length > 0) {
+      if (licenseOptions.removeLicenses === true) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'licenses and removeLicenses=true are mutually exclusive. removeLicenses strips every assigned SKU and ignores the licenses list.'
+        );
+      }
+      body.licenses = licenseOptions.licenses.map((skuId) => ({ value: skuId }));
+      body.removeLicenses = false;
+    } else if (licenseOptions?.removeLicenses !== undefined) {
+      body.removeLicenses = licenseOptions.removeLicenses;
+    }
+
+    const response = await this.request<{ Results?: unknown }>('PATCH', 'EditUser', undefined, body);
+
+    // Set-CIPPUser swallows its own exceptions and reports them as strings in
+    // Results, so EditUser returns HTTP 200 on failure. Parse, never assume.
+    const results = (Array.isArray(response?.Results) ? response.Results : []).map((r) =>
+      typeof r === 'string' ? r : JSON.stringify(r) ?? String(r)
+    );
+    const failures = results.filter((r) => /fail|error|could not|unable/i.test(r));
+
+    return {
+      status: failures.length > 0 ? 'failed' : 'edited',
+      userPrincipalName: identity.userPrincipalName,
+      results,
+      failures,
+      message:
+        failures.length > 0
+          ? `CIPP returned HTTP 200 but reported failures editing ${identity.userPrincipalName}. Do NOT report success to the caller: ${failures.join(' | ')}`
+          : `User ${identity.userPrincipalName} edited in ${tenantFilter}.`,
+    } as T;
   }
 
   /**
@@ -1209,6 +1252,54 @@ export class CippService {
   }
 
   /**
+   * Resolve a user to the identity fields CIPP's Set-CIPPUser actually consumes.
+   * Accepts an object id (GUID) or a UPN.
+   *
+   * This is mandatory, not a convenience. Set-CIPPUser rebuilds the UPN as
+   * "<username>@<Domain>" and PATCHes it back to Graph on every edit. Sending a
+   * wrong or partial identity does not fail safe - it renames the account.
+   *
+   * Uses ListUsers' UserID / graphFilter params (the only two Invoke-ListUsers
+   * actually reads) so this costs one narrow lookup, not a tenant dump.
+   */
+  private async resolveUserIdentity(
+    tenantFilter: string,
+    upnOrId: string
+  ): Promise<{ id: string; userPrincipalName: string; username: string; domain: string }> {
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const byId = GUID_RE.test(upnOrId);
+
+    const rows = await this.request<Array<Record<string, unknown>>>('GET', 'ListUsers', {
+      tenantFilter,
+      ...(byId
+        ? { UserID: upnOrId }
+        : { graphFilter: `userPrincipalName eq '${upnOrId.replace(/'/g, "''")}'` }),
+    });
+
+    const list = Array.isArray(rows) ? rows : [];
+    const match = byId
+      ? list[0]
+      : list.find(
+          (u) =>
+            typeof u.userPrincipalName === 'string' &&
+            u.userPrincipalName.toLowerCase() === upnOrId.toLowerCase()
+        );
+
+    const upn = typeof match?.userPrincipalName === 'string' ? match.userPrincipalName : undefined;
+    const id = typeof match?.id === 'string' ? match.id : undefined;
+
+    if (!upn || !id || !upn.includes('@')) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Could not resolve user "${upnOrId}" to a current UPN in tenant ${tenantFilter}. Refusing to edit: CIPP rebuilds and re-writes userPrincipalName on every EditUser call, so editing without the account's current UPN would rename it.`
+      );
+    }
+
+    const at = upn.lastIndexOf('@');
+    return { id, userPrincipalName: upn, username: upn.slice(0, at), domain: upn.slice(at + 1) };
+  }
+
+  /**
    * Resolve a user's Azure AD object id from a UPN via \`ListUsers\`. If the
    * input already looks like a GUID it is returned unchanged, so callers may
    * pass either a UPN or an object id. Throws {@link McpError} when the UPN
@@ -1235,4 +1326,3 @@ export class CippService {
     return match.id;
   }
 }
-
