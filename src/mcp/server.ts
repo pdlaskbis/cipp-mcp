@@ -87,6 +87,7 @@ Tool categories:
 - Users: list, create, edit, disable, offboard, MFA/session management, BEC check
 - Groups: list and create Azure AD groups
 - Mailboxes: list mailboxes and permissions, configure OoO and forwarding
+- Mail flow: audit transport (mail flow) rules and Exchange connectors (read-only)
 - Security: Conditional Access policies, named locations
 - Standards: compliance standards, BPA results, domain health
 - Licenses: per-tenant and CSP-level license reporting
