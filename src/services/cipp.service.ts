@@ -1251,6 +1251,45 @@ export class CippService {
     return this.request<T>('POST', 'EditGroup', undefined, body);
   }
 
+  // -------------------------------------------------------------------------
+  // Mail flow (read-only audit) — CIPP-API Email-Exchange/Transport
+  // Endpoint names + response shapes verified against KelvinTegelaar/CIPP-API
+  // (Invoke-ListTransportRules.ps1 / Invoke-ListExchangeConnectors.ps1).
+  // -------------------------------------------------------------------------
+
+  /**
+   * List Exchange Online mail flow (transport) rules for a tenant, or fetch a
+   * single rule when `id` is supplied. Calls the `ListTransportRules` Azure
+   * Function. Read-only.
+   *
+   * Response shape mirrors mailbox rules: `{ Results, Metadata }`. Single-tenant
+   * calls and single-`id` lookups resolve synchronously (no queue metadata). The
+   * `tenantFilter='AllTenants'` path builds a per-tenant cache asynchronously — a
+   * cold call returns `Metadata.QueueMessage`/`QueueId` with empty `Results`, so
+   * it goes through the same {@link getWithQueueResolution} poll as
+   * listMailboxRules instead of reporting a false "no rules".
+   */
+  async listTransportRules<T = unknown>(tenantFilter: string, id?: string): Promise<T> {
+    return this.getWithQueueResolution<T>('ListTransportRules', {
+      tenantFilter,
+      ...(id !== undefined ? { id } : {}),
+    });
+  }
+
+  /**
+   * List Exchange Online mail flow connectors (inbound + outbound) for a tenant.
+   * Calls the `ListExchangeConnectors` Azure Function. Read-only.
+   *
+   * NOTE: unlike almost every other CIPP list endpoint, Invoke-ListExchangeConnectors
+   * returns a BARE ARRAY as its body (`Body = @($Results)`), NOT a `{ Results }`
+   * envelope — each element carries a `cippconnectortype` of 'inbound'/'outbound'.
+   * So this is a plain GET and the array is returned as-is; do NOT route it through
+   * getWithQueueResolution (this endpoint has no Metadata/queue path).
+   */
+  async listExchangeConnectors<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListExchangeConnectors', { tenantFilter });
+  }
+
   /**
    * Resolve a user to the identity fields CIPP's Set-CIPPUser actually consumes.
    * Accepts an object id (GUID) or a UPN.

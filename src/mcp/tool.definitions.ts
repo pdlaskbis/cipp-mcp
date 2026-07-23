@@ -1181,6 +1181,65 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       required: ['tenantFilter', 'groupId', 'groupType'],
     },
   },
+
+  // -------------------------------------------------------------------------
+  // Mail flow tools (read-only audit) — CIPP-API Email-Exchange/Transport
+  // -------------------------------------------------------------------------
+  {
+    name: 'cipp_list_transport_rules',
+    description:
+      'Lists Exchange Online mail flow (transport) rules for a tenant, or a ' +
+      'single rule when "id" is supplied. Read-only. Primary use is auditing ' +
+      'mail flow for malicious or misconfigured rules — external auto-forwarding, ' +
+      'BEC persistence, or a rule left behind by prior mail filtering. Note: with ' +
+      "tenantFilter='allTenants' CIPP builds the data into a per-tenant cache " +
+      'asynchronously — a cold call may first return a "still loading, check back ' +
+      'in a minute" queue message instead of rows; call again shortly after. ' +
+      'Single-tenant calls return immediately.',
+    annotations: {
+      title: 'List transport (mail flow) rules',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        id: {
+          type: 'string',
+          description:
+            'Optional transport rule identity. When supplied, returns just that ' +
+            'rule (detail view) instead of all rules.',
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
+    name: 'cipp_list_exchange_connectors',
+    description:
+      'Lists Exchange Online mail flow connectors (inbound and outbound) for a ' +
+      'tenant. Read-only. Each connector is tagged with cippconnectortype ' +
+      '("inbound" / "outbound"). Use alongside transport rules to audit mail ' +
+      'routing — e.g. a rogue outbound connector or a smart-host left behind by ' +
+      'a prior mail filter.',
+    annotations: {
+      title: 'List Exchange mail flow connectors',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+      },
+      required: ['tenantFilter'],
+    },
+  },
 ];
 // ---------------------------------------------------------------------------
 // Tool Categories
@@ -1236,4 +1295,5 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
   gdap: ['cipp_list_gdap_roles', 'cipp_list_gdap_invites'],
   scheduler: ['cipp_list_scheduled_items', 'cipp_add_scheduled_item'],
   core: ['cipp_ping', 'cipp_get_version', 'cipp_list_logs'],
+  mailflow: ['cipp_list_transport_rules', 'cipp_list_exchange_connectors'],
 };

@@ -578,6 +578,18 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_list_transport_rules': {
+          const { tenantFilter, id } = args as { tenantFilter: string; id?: string };
+          result = await this.cippService.listTransportRules(tenantFilter, id);
+          break;
+        }
+
+        case 'cipp_list_exchange_connectors': {
+          const { tenantFilter } = args as { tenantFilter: string };
+          result = await this.cippService.listExchangeConnectors(tenantFilter);
+          break;
+        }
+
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
