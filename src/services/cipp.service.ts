@@ -322,10 +322,22 @@ export class CippService {
     tenantFilter: string,
     params?: { searchField?: string; searchValue?: string }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListUsers', {
-      tenantFilter,
-      ...params,
-    });
+    // Invoke-ListUsers reads only UserID and graphFilter — searchField/searchValue
+    // are silently ignored, so an unfixed search returns the ENTIRE tenant and a
+    // caller can believe it filtered. Translate to graphFilter instead.
+    const query: Record<string, unknown> = { tenantFilter };
+    const field = params?.searchField;
+    const value = params?.searchValue;
+
+    if (field && value) {
+      const escaped = value.replace(/'/g, "''");
+      query.graphFilter =
+        field === 'userPrincipalName' || field === 'mail'
+          ? `${field} eq '${escaped}'`
+          : `startsWith(${field}, '${escaped}')`;
+    }
+
+    return this.request<T>('GET', 'ListUsers', query);
   }
 
   /**
@@ -547,11 +559,59 @@ export class CippService {
     userId: string,
     options?: Record<string, unknown>
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecOffboardUser', undefined, {
+    // Test-CIPPOffboardingRequest requires Body.user as a non-empty array of UPN
+    // strings (or { value } objects) plus at least one recognised action, and
+    // rejects anything else with a 400. The previous payload sent `ID` and four
+    // option names that match nothing in CIPP's action list, so no offboarding
+    // action ever ran. Worse: on CIPP builds predating that validator the endpoint
+    // returns 200 on task CREATION having queued nothing — a silent no-op on a
+    // departing employee. Map onto CIPP's real names and fail loudly if empty.
+    if (!userId.includes('@')) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `offboardUser requires a UPN (got "${userId}"). CIPP validates Body.user entries for '@'.`
+      );
+    }
+
+    const body: Record<string, unknown> = {
       tenantFilter,
-      ID: userId,
-      ...options,
-    });
+      user: [userId],
+    };
+
+    if (options?.revokePermissions === true) body.removePermissions = true;
+    if (options?.disableUser === true) body.DisableSignIn = true;
+    if (options?.resetPassword === true) body.ResetPass = true;
+    if (typeof options?.transferMailbox === 'string' && options.transferMailbox.trim() !== '') {
+      body.AccessAutomap = [{ value: options.transferMailbox.trim() }];
+    }
+
+    const ACTIONS = ['removePermissions', 'DisableSignIn', 'ResetPass', 'AccessAutomap'];
+    if (!ACTIONS.some((k) => body[k] !== undefined)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'No offboarding actions selected. CIPP rejects an empty action set with a 400, and on older builds silently queues a no-op. Set at least one of revokePermissions, disableUser, resetPassword, transferMailbox.'
+      );
+    }
+
+    const response = await this.request<{ Results?: unknown }>(
+      'POST',
+      'ExecOffboardUser',
+      undefined,
+      body
+    );
+
+    // ExecOffboardUser returns 200 on task CREATION, never on completion.
+    // Surface that honestly rather than letting a caller read it as "done".
+    const results = (Array.isArray(response?.Results) ? response.Results : [response?.Results])
+      .filter((r) => r !== undefined && r !== null)
+      .map((r) => (typeof r === 'string' ? r : JSON.stringify(r)));
+
+    return {
+      status: 'queued',
+      userPrincipalName: userId,
+      results,
+      message: `CIPP queued an offboarding task for ${userId}. This confirms the task was CREATED, not that any action completed — check the Offboarding view before reporting success.`,
+    } as T;
   }
 
   /**
@@ -731,11 +791,26 @@ export class CippService {
     upn: string,
     oooData: Record<string, unknown>
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecSetOoO', undefined, {
+    // CIPP's Invoke-ExecSetOoO reads Body.userId and Body.AutoReplyState
+    // ('Enabled' | 'Disabled' | 'Scheduled'), not UserPrincipalName / enabled.
+    // It try/catches, so a wrong payload returns a clean HTTP 500 reading
+    // "Could not set Out of Office for user: ." — note the blank name, the tell.
+    const body: Record<string, unknown> = {
       tenantFilter,
-      UserPrincipalName: upn,
-      ...oooData,
-    });
+      userId: upn,
+      AutoReplyState: oooData.enabled === true ? 'Enabled' : 'Disabled',
+    };
+
+    // CIPP deliberately only applies a message when non-empty, so state can be
+    // flipped without wiping existing text. Omitting is correct, not a gap.
+    if (typeof oooData.internalMessage === 'string' && oooData.internalMessage.trim() !== '') {
+      body.InternalMessage = oooData.internalMessage;
+    }
+    if (typeof oooData.externalMessage === 'string' && oooData.externalMessage.trim() !== '') {
+      body.ExternalMessage = oooData.externalMessage;
+    }
+
+    return this.request<T>('POST', 'ExecSetOoO', undefined, body);
   }
 
   /**
@@ -751,11 +826,50 @@ export class CippService {
     upn: string,
     forwardData: Record<string, unknown>
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecEmailForward', undefined, {
+    // CIPP's Invoke-ExecEmailForward switches on Body.forwardOption and assigns
+    // $StatusCode ONLY inside a matching branch. No forwardOption => no branch =>
+    // $StatusCode stays null => [HttpResponseContext] throws "Cannot convert null
+    // to type System.Net.HttpStatusCode" as an opaque HTTP 500. It reads the
+    // mailbox as Body.userID (not UserPrincipalName) and passes it to Set-Mailbox
+    // as Identity *and* as the EXO -Anchor, so a UPN is required here.
+    // Casing trap: the key is lowercase forwardOption, the value is ExternalAddress.
+    const forwardTo =
+      typeof forwardData.forwardTo === 'string' ? forwardData.forwardTo.trim() : '';
+    const keepCopy = forwardData.keepCopy === true;
+
+    const body: Record<string, unknown> = {
       tenantFilter,
-      UserPrincipalName: upn,
-      ...forwardData,
-    });
+      userID: upn,
+      KeepCopy: keepCopy ? 'true' : 'false',
+    };
+
+    if (!forwardTo) {
+      body.forwardOption = 'disabled';
+    } else {
+      const at = forwardTo.lastIndexOf('@');
+      if (at < 1) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `forwardTo must be a full email address (got "${forwardTo}"). Omit it entirely to disable forwarding.`
+        );
+      }
+      const domain = forwardTo.slice(at + 1).toLowerCase();
+      const domains = await this.listDomains<Array<{ id?: string }>>(tenantFilter);
+      const isInternal = (Array.isArray(domains) ? domains : []).some(
+        (d) => typeof d?.id === 'string' && d.id.toLowerCase() === domain
+      );
+
+      if (isInternal) {
+        // ForwardingAddress: must resolve to a recipient in the org.
+        body.forwardOption = 'internalAddress';
+        body.ForwardInternal = { value: forwardTo };
+      } else {
+        body.forwardOption = 'ExternalAddress';
+        body.ForwardExternal = forwardTo;
+      }
+    }
+
+    return this.request<T>('POST', 'ExecEmailForward', undefined, body);
   }
 
   // -------------------------------------------------------------------------
@@ -1049,7 +1163,59 @@ export class CippService {
    * @param itemData - Scheduled item properties (name, recurrence, taskInfo, etc.).
    */
   async addScheduledItem<T = unknown>(itemData: Record<string, unknown>): Promise<T> {
-    return this.request<T>('POST', 'AddScheduledItem', undefined, itemData);
+    // Add-CIPPScheduledTask reads $task.Name (not taskName) and casts
+    // $task.ScheduledTime with [int64], so an ISO 8601 string throws and
+    // Invoke-AddScheduledItem has no try/catch -> unhandled 500. It also RETURNS
+    // error strings rather than throwing (unknown command, unauthorised module,
+    // blocked command, duplicate name, table-write failure) while the entrypoint
+    // hardcodes StatusCode = OK — same swallow-and-report-200 pattern as EditUser.
+    const { taskName, scheduledTime, ...rest } = itemData;
+
+    let epoch: number | undefined;
+    if (scheduledTime !== undefined && scheduledTime !== null && scheduledTime !== '') {
+      const raw = String(scheduledTime).trim();
+      if (/^\d+$/.test(raw)) {
+        epoch = Number(raw);
+      } else {
+        const parsed = Date.parse(raw);
+        if (Number.isNaN(parsed)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `scheduledTime must be an ISO 8601 datetime or a Unix epoch in seconds (got "${raw}").`
+          );
+        }
+        epoch = Math.floor(parsed / 1000);
+      }
+    }
+
+    const body: Record<string, unknown> = { ...rest };
+    if (taskName !== undefined) body.Name = taskName;
+    if (epoch !== undefined) body.ScheduledTime = epoch;
+
+    const response = await this.request<{ Results?: unknown }>(
+      'POST',
+      'AddScheduledItem',
+      undefined,
+      body
+    );
+
+    const results = (Array.isArray(response?.Results) ? response.Results : [response?.Results])
+      .filter((r) => r !== undefined && r !== null)
+      .map((r) => (typeof r === 'string' ? r : JSON.stringify(r)));
+    const failures = results.filter((r) =>
+      /^Error -|fail|error|could not|not permitted|already exists/i.test(r)
+    );
+
+    return {
+      status: failures.length > 0 ? 'failed' : 'scheduled',
+      name: taskName,
+      results,
+      failures,
+      message:
+        failures.length > 0
+          ? `CIPP returned HTTP 200 but reported failures scheduling this task. Do NOT report success to the caller: ${failures.join(' | ')}`
+          : `Scheduled task ${String(taskName ?? '(unnamed)')} created.`,
+    } as T;
   }
 
   // -------------------------------------------------------------------------
