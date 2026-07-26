@@ -304,6 +304,47 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_message_trace': {
+          const {
+            tenantFilter,
+            sender,
+            recipient,
+            days,
+            startDate,
+            endDate,
+            status,
+            fromIP,
+            toIP,
+            messageId,
+            subjectContains,
+          } = args as {
+            tenantFilter: string;
+            sender?: string;
+            recipient?: string;
+            days?: number;
+            startDate?: string;
+            endDate?: string;
+            status?: string;
+            fromIP?: string;
+            toIP?: string;
+            messageId?: string;
+            subjectContains?: string;
+          };
+          result = await this.cippService.listMessageTrace(tenantFilter, {
+            sender,
+            recipient,
+            days,
+            startDate,
+            endDate,
+            status,
+            fromIP,
+            toIP,
+            messageId,
+            subjectContains,
+          });
+          break;
+        }
+
         case 'cipp_set_out_of_office': {
           const { tenantFilter, upn, enabled, internalMessage, externalMessage } = args as {
             tenantFilter: string;

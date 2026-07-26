@@ -563,6 +563,84 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_message_trace',
+    description:
+      'Trace Exchange Online message delivery for a tenant — metadata only, ' +
+      'never message bodies. Answers "how many of these did the client receive, ' +
+      'from whom, over what window, and what happened to them" without opening a ' +
+      'portal per tenant. Returns, per message: MessageTraceId, Status, Subject, ' +
+      'SenderAddress, RecipientAddress, Received, FromIP, ToIP. Filter by sender, ' +
+      'recipient, a date window (days, or startDate/endDate), delivery status, or ' +
+      'source/destination IP. To retrieve a single known message, pass messageId ' +
+      '(date/status/IP filters are then ignored). Message BODIES are out of scope ' +
+      '— trace exposes headers/metadata only.',
+    annotations: {
+      title: 'Message trace (metadata only)',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        sender: {
+          type: 'string',
+          description: 'Filter by sender (From) address. Partial addresses are supported by Exchange.',
+        },
+        recipient: {
+          type: 'string',
+          description: 'Filter by recipient (To) address.',
+        },
+        days: {
+          type: 'integer',
+          description:
+            'Trace the last N days. Convenience for a rolling window; takes precedence ' +
+            'over startDate/endDate when both are given. Exchange retains ~10 days of trace.',
+        }
+        startDate: {
+          type: 'string',
+          description:
+            "Window start, as an ISO-8601 UTC timestamp 'yyyy-MM-ddTHH:mm:ssZ' or a Unix " +
+            'epoch-seconds string. Ignored when days is set.',
+        },
+        endDate: {
+          type: 'string',
+          description:
+            "Window end, same formats as startDate. Ignored when days is set.",
+        },
+        status: {
+          type: 'string',
+          description:
+            'Filter by delivery status (e.g. Delivered, Failed, Pending, Quarantined, ' +
+            'FilteredAsSpam). Case-insensitive.',
+        },
+        fromIP: {
+          type: 'string',
+          description: 'Filter by originating source IP address.',
+        },
+        toIP: {
+          type: 'string',
+          description: 'Filter by destination IP address.',
+        },
+        messageId: {
+          type: 'string',
+          description:
+            'Retrieve a single message by its Internet message ID. When set, the date, ' +
+            'status and IP filters are ignored (sender/recipient still narrow the result).',
+        },
+        subjectContains: {
+          type: 'string',
+          description:
+            'Return only messages whose Subject contains this text (case-insensitive). ' +
+            'Applied client-side after retrieval — Exchange has no server-side subject filter.',
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
     name: 'cipp_set_out_of_office',
     description:
       '⚠ HIGH-IMPACT. Configures the out-of-office / auto-reply for a mailbox, ' +
@@ -1378,6 +1456,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
   mailboxes: [
     'cipp_list_mailboxes',
     'cipp_list_mailbox_permissions',
+    'cipp_message_trace',
     'cipp_edit_mailbox_permissions',
     'cipp_convert_to_shared_mailbox',
     'cipp_list_mailbox_rules',
