@@ -637,14 +637,206 @@ export class CippService {
   }
 
   /**
-   * Run a Business Email Compromise (BEC) check for a user.
-   * Calls the `ExecBECCheck` Azure Function.
+   * Run a Business Email Compromise (BEC) check for a user and return the
+   * actual findings, not a job handle.
    *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to check.
+   * CONTRACT (verified against KelvinTegelaar/CIPP-API tag 10.7.0,
+   * Invoke-ExecBECCheck.ps1 — there is NO separate result endpoint):
+   *
+   *   Invoke-ExecBECCheck reads `Query.userid ?? Query.GUID`, looks up the
+   *   `cachebec` table (PartitionKey 'bec', RowKey = the user's object id) and
+   *   branches:
+   *     1. Results empty AND Status -ne 'Waiting'  -> queue BECRunOrchestrator,
+   *        write a Status='Waiting' row, return { GUID = userid }
+   *     2. else if Query.GUID is NOT set           -> return { GUID = userid }
+   *     3. else if row missing or Status='Waiting' -> return { Waiting = true }
+   *     4. else                                    -> return the Results
+   *
+   *   Branch 4 is reachable ONLY when GUID is on the query string. The previous
+   *   implementation sent `userId` alone, so it hit branch 2 on every call and
+   *   could never return a finding no matter how many times it was called. The
+   *   bug was a missing query parameter, not a missing endpoint.
+   *
+   *   The "GUID" is not a job id — it is the user's object id echoed back.
+   *
+   * ALERTING: every return path carries an `alert` field that is either null or
+   * a ready-to-render payload. This method NEVER sends anything itself. Emitting
+   * the alert as data keeps `readOnlyHint: true` honest, adds no webhook secret
+   * to a container with GDAP reach, and leaves one card renderer instead of two.
+   * `facts` is already in Adaptive Card FactSet shape so a caller can drop it
+   * straight into a card.
+   *
+   * KNOWN GAP: a thrown McpError bypasses this envelope entirely, so the caller
+   * must alert on exceptions too — the alert field covers "ran but wrong", not
+   * "did not run".
    */
-  async becCheck<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('GET', 'ExecBECCheck', { tenantFilter, userId });
+  async becCheck<T = unknown>(
+    tenantFilter: string,
+    userIdOrUpn: string,
+    options?: { useCached?: boolean; maxAttempts?: number; intervalMs?: number }
+  ): Promise<T> {
+    type BecEnvelope = { GUID?: string; Waiting?: boolean } & Record<string, unknown>;
+
+    const maxAttempts = options?.maxAttempts ?? 9;
+    const intervalMs = options?.intervalMs ?? 10_000;
+
+    // CIPP passes userName into the BECRun orchestrator batch alongside UserID.
+    // USER_ID_PROP already advertises "object id OR UPN", which the old code did
+    // not honour — it passed whatever it got straight through as the cache row
+    // key. Resolve both halves up front so the declared contract is real.
+    const identity = await this.resolveUserIdentity(tenantFilter, userIdOrUpn);
+
+    // ---- Phase 1: kick off -------------------------------------------------
+    // overwrite=true forces a fresh orchestrator run even when a cached row
+    // exists. Opt out only when the caller explicitly wants the cached answer.
+    await this.request<BecEnvelope>('GET', 'ExecBECCheck', {
+      tenantFilter,
+      userId: identity.id,
+      userName: identity.userPrincipalName,
+      ...(options?.useCached === true ? {} : { overwrite: true }),
+    });
+
+    // ---- Phase 2: poll on GUID --------------------------------------------
+    // Sending GUID is what makes branches 3/4 reachable. Do not add userId here.
+    let attempts = 0;
+    let requeues = 0;
+    let last: BecEnvelope | undefined;
+
+    while (attempts < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      attempts += 1;
+
+      last = await this.request<BecEnvelope>('GET', 'ExecBECCheck', {
+        tenantFilter,
+        GUID: identity.id,
+      });
+
+      if (last?.Waiting === true) continue;
+
+      // A bare { GUID } on a GUID-bearing poll means branch 1 fired: the run
+      // finished with EMPTY Results, so CIPP treated it as never-run and
+      // re-queued it. That is indistinguishable at the API from "ran and found
+      // nothing", and it will loop. Never render it as an all-clear.
+      if (last && last.GUID !== undefined && last.Waiting === undefined) {
+        requeues += 1;
+        if (requeues >= 2) {
+          return {
+            status: 'indeterminate',
+            verified: false,
+            userPrincipalName: identity.userPrincipalName,
+            findings: null,
+            recheck: {
+              tool: 'cipp_bec_check',
+              args: { tenantFilter, userId: identity.userPrincipalName, useCached: true },
+            },
+            alert: {
+              severity: 'warning',
+              kind: 'malfunction',
+              title: 'BEC check returned an undeterminable result',
+              facts: [
+                { name: 'Tenant', value: tenantFilter },
+                { name: 'User', value: identity.userPrincipalName },
+                { name: 'Symptom', value: `CIPP re-queued the job ${requeues}x on an empty result set` },
+                { name: 'Where', value: 'CIPP ExecBECCheck / cachebec table / BECRunOrchestrator' },
+                { name: 'Risk', value: 'This is NOT an all-clear — the account status is unknown' },
+              ],
+              nextStep:
+                `Open the BEC view in CIPP for ${identity.userPrincipalName} in ${tenantFilter} and confirm by hand. ` +
+                'Do not close any related ticket on this result.',
+            },
+            message:
+              `BEC check for ${identity.userPrincipalName} completed with an empty result set and CIPP re-queued it (${requeues}x). ` +
+              'CIPP cannot distinguish "ran and found nothing" from "never ran" when Results is empty. ' +
+              'Do NOT report this as clean. Confirm in the CIPP BEC view before drawing any conclusion.',
+          } as T;
+        }
+        continue;
+      }
+
+      // Anything else is the Results payload. Table storage may hand it back as
+      // a JSON string rather than an object; normalise without inventing shape.
+      let findings: unknown = last;
+      if (typeof last === 'string') {
+        try {
+          findings = JSON.parse(last);
+        } catch {
+          findings = last;
+        }
+      }
+
+      // Note the CIPP-side consequence of branch 1: a genuinely clean run leaves
+      // Results empty, which re-queues rather than completing. So reaching here
+      // means CIPP stored SOMETHING. Treat that as alert-worthy until the real
+      // Results shape is known and a finer severity rule can be written.
+      // TODO(threshold): once a live run is observed, replace "any result" with
+      // finding-type severity — see the open decision in the alerting program.
+      const hasFindings =
+        findings !== undefined &&
+        findings !== null &&
+        !(Array.isArray(findings) && findings.length === 0);
+
+      return {
+        status: 'complete',
+        verified: true,
+        verifiedBy: `ExecBECCheck returned cachebec Results for ${identity.id}`,
+        userPrincipalName: identity.userPrincipalName,
+        findings,
+        recheck: null,
+        alert: hasFindings
+          ? {
+              severity: 'critical',
+              kind: 'finding',
+              title: 'BEC check returned findings',
+              facts: [
+                { name: 'Tenant', value: tenantFilter },
+                { name: 'User', value: identity.userPrincipalName },
+                { name: 'Object ID', value: identity.id },
+                { name: 'Where', value: 'CIPP BEC view — Identity > Administration > Users' },
+              ],
+              nextStep:
+                'Review the findings before taking action. Containment is cipp_bec_remediate, which locks the ' +
+                'user out immediately — raise the Autotask Security Incident ticket and preserve evidence first ' +
+                'where time allows.',
+            }
+          : null,
+        message: `BEC check complete for ${identity.userPrincipalName} in ${tenantFilter}. Findings below are CIPP's, unmodified.`,
+      } as T;
+    }
+
+    // ---- Timed out, but NOT a dead end -------------------------------------
+    // The job is still running server-side. Because kickoff and fetch are the
+    // same endpoint, the caller re-fetches by calling this tool again with
+    // useCached=true — which skips overwrite and reads the row in place.
+    const elapsed = Math.round((attempts * intervalMs) / 1000);
+    return {
+      status: 'pending',
+      verified: false,
+      userPrincipalName: identity.userPrincipalName,
+      findings: null,
+      recheck: {
+        tool: 'cipp_bec_check',
+        args: { tenantFilter, userId: identity.userPrincipalName, useCached: true },
+        notBefore: `${elapsed}s from now`,
+      },
+      alert: {
+        severity: 'info',
+        kind: 'malfunction',
+        title: 'BEC check did not finish inside the poll budget',
+        facts: [
+          { name: 'Tenant', value: tenantFilter },
+          { name: 'User', value: identity.userPrincipalName },
+          { name: 'Elapsed', value: `${elapsed}s across ${attempts} polls` },
+          { name: 'Where', value: 'CIPP BECRunOrchestrator — still executing, not cancelled' },
+        ],
+        nextStep:
+          `Call cipp_bec_check again for ${identity.userPrincipalName} with useCached=true to collect the ` +
+          'findings without restarting the run. No result has been established yet.',
+      },
+      message:
+        `BEC check for ${identity.userPrincipalName} is still running after ${attempts} polls (~${elapsed}s). ` +
+        'The job was NOT cancelled — it is still executing in CIPP. Do NOT report a result. Call ' +
+        'cipp_bec_check again with useCached=true to collect the findings without restarting the run.',
+    } as T;
   }
 
   /**

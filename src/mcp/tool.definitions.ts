@@ -359,12 +359,49 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
   {
     name: 'cipp_bec_check',
-    description: 'Run a Business Email Compromise check on a user',
+    description:
+      'Runs a Business Email Compromise check on a user and returns the actual ' +
+      'findings, not a job handle. Read-only. CIPP executes the check as a ' +
+      'background orchestrator job; this tool starts it and then polls for the ' +
+      'result, so a single call can take up to ~90 seconds. If the job is still ' +
+      'running when the poll budget is spent, the tool returns status="pending" ' +
+      'with a recheck instruction — call it again with useCached=true to collect ' +
+      'the findings WITHOUT restarting the run. By default every call forces a ' +
+      'fresh check: a cached result from an earlier investigation must never be ' +
+      'mistaken for a live one. Report a user as clean ONLY when ' +
+      'status="complete". status="indeterminate" means CIPP returned an empty ' +
+      'result set it cannot distinguish from "never ran" — that is not an ' +
+      'all-clear and must be confirmed in the CIPP BEC view.',
+    annotations: {
+      title: 'BEC check — run and return findings',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     inputSchema: {
       type: 'object',
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
         userId: USER_ID_PROP,
+        useCached: {
+          type: 'boolean',
+          description:
+            'When true, return a previous run\u2019s cached findings instead of ' +
+            'forcing a fresh check. This is how you collect the result of a call ' +
+            'that came back status="pending" — it reads the stored row in place ' +
+            'and does not restart the job. Defaults to false.',
+        },
+        maxAttempts: {
+          type: 'number',
+          description:
+            'Number of poll attempts after the job is started. Defaults to 9. ' +
+            'Raise only if the MCP client tool-call deadline allows it.',
+        },
+        intervalMs: {
+          type: 'number',
+          description: 'Milliseconds between poll attempts. Defaults to 10000.',
+        },
       },
       required: ['tenantFilter', 'userId'],
     },
