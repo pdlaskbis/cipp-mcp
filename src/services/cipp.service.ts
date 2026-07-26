@@ -513,7 +513,7 @@ export class CippService {
     const id = await this.resolveUserObjectId(tenantFilter, userId);
     return (await this.verifyWrite({
       run: () =>
-        this.request('POST', 'ExecDisableUser', undefined, { tenantFilter, ID: userId }),
+        this.request('POST', 'ExecDisableUser', undefined, { tenantFilter, ID: id }),
       verifiedBy: 'accountEnabled',
       readback: async () => {
         const user = await this.readUserById<{ accountEnabled?: boolean }>(tenantFilter, id);
