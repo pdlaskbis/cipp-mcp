@@ -52,7 +52,18 @@ describe('CippService becCheck — two-phase ExecBECCheck contract', () => {
       .mockResolvedValueOnce(identityLookup())
       .mockResolvedValueOnce(jsonResponse({ GUID: USER_ID })) // kickoff
       .mockResolvedValueOnce(jsonResponse({ Waiting: true })) // still running
-      .mockResolvedValueOnce(jsonResponse([{ rule: 'forward-to-external' }]));
+      .mockResolvedValueOnce(
+        jsonResponse({
+          NewRules: [
+            { Name: 'Silent forward', Enabled: true, ForwardTo: ['mallory@evil.example'] },
+          ],
+          AddedApps: [],
+          SuspectUserMailboxLogons: [],
+          MailboxPermissionChanges: [],
+          ExtractedAt: '2026-07-26T14:12:50Z',
+          ExtractResult: 'Successfully extracted logs from auditlog',
+        })
+      );
     global.fetch = fetchMock as unknown as typeof fetch;
 
     const promise = svc.becCheck(TENANT, UPN, {
@@ -76,7 +87,7 @@ describe('CippService becCheck — two-phase ExecBECCheck contract', () => {
 
     expect(result.status).toBe('complete');
     expect(result.verified).toBe(true);
-    expect(result.findings).toEqual([{ rule: 'forward-to-external' }]);
+    expect((result.findings as Record<string, unknown>).ExtractResult).toMatch(/success/i);
     expect(result.alert?.severity).toBe('critical');
     expect(result.alert?.kind).toBe('finding');
   });
@@ -136,7 +147,13 @@ describe('CippService becCheck — two-phase ExecBECCheck contract', () => {
       .fn<Promise<Response>, [string, RequestInit]>()
       .mockResolvedValueOnce(identityLookup())
       .mockResolvedValueOnce(jsonResponse({ GUID: USER_ID })) // kickoff
-      .mockResolvedValueOnce(jsonResponse([{ rule: 'cached-finding' }]));
+      .mockResolvedValueOnce(
+        jsonResponse({
+          NewRules: [],
+          ExtractedAt: '2026-07-26T14:12:50Z',
+          ExtractResult: 'Successfully extracted logs from auditlog',
+        })
+      );
     global.fetch = fetchMock as unknown as typeof fetch;
 
     const promise = svc.becCheck(TENANT, UPN, {

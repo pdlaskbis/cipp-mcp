@@ -673,7 +673,12 @@ export class CippService {
   async becCheck<T = unknown>(
     tenantFilter: string,
     userIdOrUpn: string,
-    options?: { useCached?: boolean; maxAttempts?: number; intervalMs?: number }
+    options?: {
+      useCached?: boolean;
+      maxAttempts?: number;
+      intervalMs?: number;
+      baseline?: { knownAppIds?: string[]; knownIPs?: string[] };
+    }
   ): Promise<T> {
     type BecEnvelope = { GUID?: string; Waiting?: boolean } & Record<string, unknown>;
 
@@ -764,42 +769,55 @@ export class CippService {
         }
       }
 
-      // Note the CIPP-side consequence of branch 1: a genuinely clean run leaves
-      // Results empty, which re-queues rather than completing. So reaching here
-      // means CIPP stored SOMETHING. Treat that as alert-worthy until the real
-      // Results shape is known and a finer severity rule can be written.
-      // TODO(threshold): once a live run is observed, replace "any result" with
-      // finding-type severity — see the open decision in the alerting program.
-      const hasFindings =
-        findings !== undefined &&
-        findings !== null &&
-        !(Array.isArray(findings) && findings.length === 0);
+      // ExtractResult is CIPP's own completion signal and is far more reliable
+      // than inferring completion from whether Results is empty.
+      const resultObj = (findings ?? {}) as Record<string, unknown>;
+      const extractResult = String(resultObj.ExtractResult ?? '');
+      const extractedAt = String(resultObj.ExtractedAt ?? '');
+      const extractOk = /success/i.test(extractResult);
+
+      const assessment = this.assessBecFindings(resultObj, options?.baseline);
 
       return {
         status: 'complete',
-        verified: true,
-        verifiedBy: `ExecBECCheck returned cachebec Results for ${identity.id}`,
+        verified: extractOk,
+        verifiedBy: extractOk
+          ? `CIPP ExtractResult: ${extractResult} (extracted ${extractedAt})`
+          : `ExecBECCheck returned cachebec Results for ${identity.id}`,
         userPrincipalName: identity.userPrincipalName,
+        assessment,
         findings,
         recheck: null,
-        alert: hasFindings
-          ? {
-              severity: 'critical',
-              kind: 'finding',
-              title: 'BEC check returned findings',
-              facts: [
-                { name: 'Tenant', value: tenantFilter },
-                { name: 'User', value: identity.userPrincipalName },
-                { name: 'Object ID', value: identity.id },
-                { name: 'Where', value: 'CIPP BEC view — Identity > Administration > Users' },
-              ],
-              nextStep:
-                'Review the findings before taking action. Containment is cipp_bec_remediate, which locks the ' +
-                'user out immediately — raise the Autotask Security Incident ticket and preserve evidence first ' +
-                'where time allows.',
-            }
-          : null,
-        message: `BEC check complete for ${identity.userPrincipalName} in ${tenantFilter}. Findings below are CIPP's, unmodified.`,
+        alert:
+          assessment.severity === 'info'
+            ? null
+            : {
+                severity: assessment.severity,
+                kind: 'finding',
+                title:
+                  assessment.severity === 'critical'
+                    ? 'BEC check found compromise indicators'
+                    : 'BEC check found activity needing review',
+                facts: [
+                  { name: 'Tenant', value: tenantFilter },
+                  { name: 'User', value: identity.userPrincipalName },
+                  ...assessment.reasons
+                    .slice(0, 8)
+                    .map((r, i) => ({ name: `Indicator ${i + 1}`, value: r })),
+                  { name: 'Where', value: 'CIPP BEC view — Identity > Administration > Users' },
+                ],
+                nextStep:
+                  assessment.severity === 'critical'
+                    ? 'Review the indicators before acting. Containment is cipp_bec_remediate, which locks the ' +
+                      'user out immediately — raise the Autotask Security Incident ticket and preserve evidence ' +
+                      'first where time allows.'
+                    : 'Triage against what is expected for this tenant. Pass knownAppIds / knownIPs on the next ' +
+                      'call to suppress anything confirmed legitimate.',
+              },
+        message: extractOk
+          ? `BEC check complete for ${identity.userPrincipalName} in ${tenantFilter} (severity: ${assessment.severity}). Findings below are CIPP's, unmodified.`
+          : `BEC check returned data for ${identity.userPrincipalName} but CIPP did not report a successful extract ` +
+            `(ExtractResult: "${extractResult}"). Treat the findings as INCOMPLETE — do not report an all-clear.`,
       } as T;
     }
 
@@ -1646,6 +1664,121 @@ export class CippService {
    */
   async listExchangeConnectors<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListExchangeConnectors', { tenantFilter });
+  }
+
+  /**
+   * Classify a CIPP BEC result into an alert severity.
+   *
+   * Written against the real Results shape observed on a live run. Every bucket
+   * is populated on every run — failed logons against Azure Resource Manager
+   * from scattered IPs are password-spray background radiation present in any
+   * tenant. Alerting on PRESENCE therefore fires critical forever, which is
+   * alert fatigue and fails the same way as no alerting at all.
+   *
+   * So this keys on the shapes that actually indicate compromise:
+   *   - inbox rules that forward, redirect, or silently delete
+   *   - mailbox delegation grants, excluding Exchange's own NT SERVICE entries
+   *   - newly consented OAuth applications (token-based persistence)
+   *   - SUCCESSFUL logons from unrecognised IPs — never the failed ones
+   *
+   * No baseline is assumed. Without `baseline` the app and IP checks report as
+   * warnings for human triage rather than pretending to know what is normal for
+   * this tenant. Supply knownAppIds / knownIPs to suppress the known-good.
+   */
+  private assessBecFindings(
+    findings: Record<string, unknown>,
+    baseline?: { knownAppIds?: string[]; knownIPs?: string[] }
+  ): {
+    severity: 'critical' | 'warning' | 'info';
+    reasons: string[];
+    counts: Record<string, number>;
+  } {
+    const arr = (key: string): Array<Record<string, unknown>> => {
+      const v = findings?.[key];
+      return Array.isArray(v) ? (v as Array<Record<string, unknown>>) : [];
+    };
+
+    const knownApps = new Set((baseline?.knownAppIds ?? []).map((s) => s.toLowerCase()));
+    const knownIPs = new Set(baseline?.knownIPs ?? []);
+
+    const reasons: string[] = [];
+    let critical = false;
+    let warning = false;
+
+    const nonEmpty = (v: unknown): boolean =>
+      v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0);
+
+    // Inbox rules that forward, redirect, or silently delete.
+    const rules = arr('NewRules');
+    for (const r of rules) {
+      const acts: string[] = [];
+      if (nonEmpty(r.ForwardTo)) acts.push('forwards');
+      if (nonEmpty(r.RedirectTo)) acts.push('redirects');
+      if (nonEmpty(r.ForwardAsAttachmentTo)) acts.push('forwards as attachment');
+      if (r.DeleteMessage === true) acts.push('deletes');
+      if (r.PermanentDelete === true) acts.push('permanently deletes');
+      if (acts.length > 0) {
+        critical = true;
+        reasons.push(
+          `Inbox rule "${String(r.Name ?? '(unnamed)')}" ${acts.join(' + ')} mail` +
+            (r.Enabled === false ? ' (currently disabled)' : '')
+        );
+      }
+    }
+
+    // Mailbox delegation grants. Exchange grants DiscoverySearchMailbox to its
+    // own service principal on every tenant; that is not a finding.
+    for (const p of arr('MailboxPermissionChanges')) {
+      const perms = String(p.Permissions ?? '');
+      const who = String(p.UserKey ?? '');
+      const isService = /^NT SERVICE\\/i.test(who);
+      if (!isService && /FullAccess|SendAs|SendOnBehalf/i.test(perms)) {
+        critical = true;
+        reasons.push(
+          `${String(p.Operation ?? 'permission change')}: ${who} granted ${perms} on ${String(p.ObjectId ?? '?')}`
+        );
+      }
+    }
+
+    // Newly registered OAuth applications.
+    for (const a of arr('AddedApps')) {
+      const appId = String(a.appId ?? '').toLowerCase();
+      if (appId && knownApps.has(appId)) continue;
+      warning = true;
+      reasons.push(
+        `New application "${String(a.displayName ?? a.appDisplayName ?? appId)}" registered ${String(a.createdDateTime ?? '')}`.trim()
+      );
+    }
+
+    // SUCCESSFUL logons from unrecognised IPs. Failed logons are spray noise
+    // and are deliberately ignored.
+    const successIPs = new Set<string>();
+    for (const l of arr('SuspectUserMailboxLogons')) {
+      if (String(l.Status ?? '') !== 'Success') continue;
+      const ip = String(l.IPAddress ?? '');
+      if (ip && !knownIPs.has(ip)) successIPs.add(ip);
+    }
+    if (successIPs.size > 0) {
+      warning = true;
+      reasons.push(
+        `Successful sign-ins from ${successIPs.size} unrecognised IP(s): ${[...successIPs].join(', ')}`
+      );
+    }
+
+    const counts: Record<string, number> = {
+      newRules: rules.length,
+      addedApps: arr('AddedApps').length,
+      permissionChanges: arr('MailboxPermissionChanges').length,
+      newUsers: arr('NewUsers').length,
+      changedPasswords: arr('ChangedPasswords').length,
+      logonRecords: arr('SuspectUserMailboxLogons').length,
+    };
+
+    return {
+      severity: critical ? 'critical' : warning ? 'warning' : 'info',
+      reasons,
+      counts,
+    };
   }
 
   /**
