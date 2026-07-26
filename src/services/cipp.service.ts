@@ -1736,9 +1736,10 @@ export class CippService {
     for (const p of arr('MailboxPermissionChanges')) {
       const perms = String(p.Permissions ?? '');
       const who = String(p.UserKey ?? '');
+      const obj = String(p.ObjectId ?? '');
       const isService = /^NT SERVICE\\/i.test(who);
-      if (!isService && /FullAccess|SendAs|SendOnBehalf/i.test(perms)) {
-        critical = true;
+      const isHousekeeping = isService && /DiscoverySearchMailbox/i.test(obj);
+      if (!isHousekeeping && /\b(FullAccess|SendAs|SendOnBehalf)\b/i.test(perms)) {
         reasons.push(
           `${String(p.Operation ?? 'permission change')}: ${who} granted ${perms} on ${String(p.ObjectId ?? '?')}`
         );
