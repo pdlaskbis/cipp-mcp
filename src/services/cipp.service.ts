@@ -1048,9 +1048,15 @@ export class CippService {
    * @param upn          - User principal name / primary SMTP address of the mailbox.
    */
   async listMailboxPermissions<T = unknown>(tenantFilter: string, upn: string): Promise<T> {
+    // CONTRACT (KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListmailboxPermissions.ps1):
+    // the endpoint reads `$Request.Query.userId` and passes it to Get-Mailbox /
+    // Get-MailboxPermission / Get-RecipientPermission as -Identity. The previous
+    // payload sent `UserPrincipalName`, which CIPP never reads — so userId stayed
+    // null and the live-query path ran with a null Identity. Send `userId`.
+    // Returns an array of { User, Permissions } (FullAccess / SendAs / SendOnBehalf).
     return this.request<T>('GET', 'ListmailboxPermissions', {
       tenantFilter,
-      UserPrincipalName: upn,
+      userId: upn,
     });
   }
 
