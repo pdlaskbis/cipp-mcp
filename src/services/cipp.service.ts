@@ -1705,8 +1705,13 @@ export class CippService {
     let critical = false;
     let warning = false;
 
-    const nonEmpty = (v: unknown): boolean =>
-      v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0);
+    const nonEmpty = (v: unknown): boolean => {
+      if (v === null || v === undefined) return false;
+      if (typeof v === 'string') return v.trim().length > 0;
+      if (Array.isArray(v)) return v.length > 0;
+      if (typeof v === 'object') return Object.keys(v as object).length > 0;
+      return true;
+    };
 
     // Inbox rules that forward, redirect, or silently delete.
     const rules = arr('NewRules');
