@@ -57,6 +57,30 @@ const DOMAIN_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 // ---------------------------------------------------------------------------
 
 /**
+ * The verification envelope every mutating CIPP tool returns once wrapped by
+ * {@link CippService.verifyWrite}. It answers the question a tech actually has —
+ * "did this land in Microsoft?" — rather than "did CIPP accept the job?".
+ *
+ * `verified` is true ONLY when a Microsoft-side readback confirmed the change.
+ * A write that CIPP accepted but that could not be confirmed returns
+ * `verified: false` with a `recheck` instruction, never a success message.
+ */
+export interface VerifiedWriteEnvelope {
+  /** 'verified' once the readback confirmed the change; 'unverified' otherwise. */
+  status: 'verified' | 'unverified';
+  /** True ONLY when a Microsoft-side readback confirmed the change landed. */
+  verified: boolean;
+  /** The concrete field/read that proves the change (e.g. 'accountEnabled'). */
+  verifiedBy: string;
+  /** How to confirm manually when unverified; null once verified. */
+  recheck: { instruction: string } | null;
+  /** Human-facing summary. Never claims success while `verified` is false. */
+  message: string;
+  /** The raw CIPP acceptance/ack response, for auditing. */
+  submission: unknown;
+}
+
+/**
  * HTTP client for the CIPP Azure Function App API.
  *
  * All public methods map one-to-one to CIPP Azure Function endpoints.
@@ -484,10 +508,20 @@ export class CippService {
    * @param userId       - Azure AD object ID of the user to disable.
    */
   async disableUser<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecDisableUser', undefined, {
-      tenantFilter,
-      ID: userId,
-    });
+    // Resolve to an object id for the readback: accountEnabled is only returned
+    // by the ListUsers UserID (by-id) select, not a UPN/graphFilter query.
+    const id = await this.resolveUserObjectId(tenantFilter, userId);
+    return (await this.verifyWrite({
+      run: () =>
+        this.request('POST', 'ExecDisableUser', undefined, { tenantFilter, ID: userId }),
+      verifiedBy: 'accountEnabled',
+      readback: async () => {
+        const user = await this.readUserById<{ accountEnabled?: boolean }>(tenantFilter, id);
+        return user?.accountEnabled === false;
+      },
+      successMessage: `Sign-in disabled for ${userId} in ${tenantFilter} (accountEnabled=false confirmed).`,
+      recheckMessage: `CIPP accepted ExecDisableUser for ${userId}, but accountEnabled was not observed false within the verification window. Re-check the account (by object id) before confirming it is disabled.`,
+    })) as T;
   }
 
   /**
@@ -503,11 +537,43 @@ export class CippService {
     userId: string,
     newPassword?: string
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecResetPass', undefined, {
+    const id = await this.resolveUserObjectId(tenantFilter, userId);
+
+    // Capture the pre-write lastPasswordChangeDateTime so we verify against an
+    // ADVANCE, not just presence — a reset always moves this field forward.
+    // Server clock skew makes "compare to now" unreliable, so we compare to the
+    // account's own prior value instead.
+    const before = await this.readUserById<{ lastPasswordChangeDateTime?: string }>(
       tenantFilter,
-      ID: userId,
-      ...(newPassword && { newPassword }),
-    });
+      id
+    );
+    const baseline = before?.lastPasswordChangeDateTime
+      ? new Date(before.lastPasswordChangeDateTime).getTime()
+      : null;
+
+    return (await this.verifyWrite({
+      run: () =>
+        this.request('POST', 'ExecResetPass', undefined, {
+          tenantFilter,
+          ID: userId,
+          ...(newPassword && { newPassword }),
+        }),
+      verifiedBy: 'lastPasswordChangeDateTime',
+      readback: async () => {
+        const user = await this.readUserById<{ lastPasswordChangeDateTime?: string }>(
+          tenantFilter,
+          id
+        );
+        if (!user?.lastPasswordChangeDateTime) return false;
+        const now = new Date(user.lastPasswordChangeDateTime).getTime();
+        if (Number.isNaN(now)) return false;
+        // Without a readable baseline we cannot prove the value advanced, so we
+        // stay unverified and let the recheck instruction cover it.
+        return baseline !== null && now > baseline;
+      },
+      successMessage: `Password reset for ${userId} in ${tenantFilter} confirmed (lastPasswordChangeDateTime advanced).`,
+      recheckMessage: `CIPP accepted ExecResetPass for ${userId}, but an advance in lastPasswordChangeDateTime was not observed within the verification window. Re-check the account (by object id) before confirming the reset.`,
+    })) as T;
   }
 
   /**
@@ -1803,6 +1869,86 @@ export class CippService {
    * Uses ListUsers' UserID / graphFilter params (the only two Invoke-ListUsers
    * actually reads) so this costs one narrow lookup, not a tenant dump.
    */
+  /**
+   * Run a mutating CIPP call, then poll a Microsoft-side readback until it
+   * confirms the change landed — returning the {@link VerifiedWriteEnvelope}.
+   *
+   * The point of this helper is honesty under a specific CIPP behaviour: many
+   * Exec* endpoints return HTTP 200 the moment the job is ACCEPTED, not when it
+   * completes (some take 2-3 minutes). A bare ack is therefore not proof. This
+   * wrapper never reports success on the ack alone:
+   *   - `readback` returns true once the change is observable in Microsoft.
+   *   - a readback that throws is treated as "not yet confirmed" (a failed READ
+   *     is not a failed WRITE), so we keep polling and, at the deadline, return
+   *     verified:false with a recheck instruction rather than a false success.
+   *
+   * @param run             executes the write; its result is returned as `submission`.
+   * @param verifiedBy      the field/read that proves the change (goes in the envelope).
+   * @param readback        returns true once Microsoft reflects the change.
+   * @param successMessage  message when verified.
+   * @param recheckMessage  how to confirm manually when unverified.
+   * @param timeoutMs        total polling budget (default 30s). Kept short so it
+   *                         never outlives an MCP gateway tool-call deadline.
+   * @param intervalMs       delay between polls (default 5s).
+   */
+  private async verifyWrite(opts: {
+    run: () => Promise<unknown>;
+    verifiedBy: string;
+    readback: () => Promise<boolean>;
+    successMessage: string;
+    recheckMessage: string;
+    timeoutMs?: number;
+    intervalMs?: number;
+  }): Promise<VerifiedWriteEnvelope> {
+    const submission = await opts.run();
+    const timeoutMs = opts.timeoutMs ?? 30_000;
+    const intervalMs = opts.intervalMs ?? 5_000;
+
+    const deadline = Date.now() + timeoutMs;
+    let verified = false;
+    // Always attempt at least one readback, then poll until the deadline.
+    for (;;) {
+      try {
+        verified = await opts.readback();
+      } catch {
+        // A failed READ is not a failed WRITE. Stay unverified and keep polling.
+        verified = false;
+      }
+      if (verified || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+
+    return {
+      status: verified ? 'verified' : 'unverified',
+      verified,
+      verifiedBy: opts.verifiedBy,
+      recheck: verified ? null : { instruction: opts.recheckMessage },
+      message: verified
+        ? opts.successMessage
+        : `${opts.recheckMessage} Do NOT report success until confirmed.`,
+      submission,
+    };
+  }
+
+  /**
+   * Read a single user back by object id via `ListUsers` with `UserID`. This
+   * path — and ONLY this path — makes CIPP apply its explicit `$select`, which
+   * returns `accountEnabled` and `lastPasswordChangeDateTime` (a UPN/graphFilter
+   * query returns Graph's default property set, which omits both). Verified
+   * against KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListUsers.ps1.
+   */
+  private async readUserById<T = Record<string, unknown>>(
+    tenantFilter: string,
+    id: string
+  ): Promise<T | undefined> {
+    const rows = await this.request<Array<Record<string, unknown>>>('GET', 'ListUsers', {
+      tenantFilter,
+      UserID: id,
+    });
+    const list = Array.isArray(rows) ? rows : [];
+    return (list[0] as T) ?? undefined;
+  }
+
   private async resolveUserIdentity(
     tenantFilter: string,
     upnOrId: string
