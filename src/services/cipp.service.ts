@@ -1642,11 +1642,46 @@ export class CippService {
     id: string,
     mailboxType: string
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecConvertMailbox', undefined, {
-      tenantFilter,
-      ID: id,
-      MailboxType: mailboxType,
-    });
+    // Target recipientTypeDetails per requested type. Verified against
+    // KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListMailboxes.ps1: the read
+    // returns `recipientTypeDetails` (Get-Mailbox RecipientTypeDetails) and
+    // accepts an `Identity` filter, so the readback is scoped to one mailbox
+    // rather than pulling the whole tenant.
+    const TARGET: Record<string, string> = {
+      shared: 'sharedmailbox',
+      room: 'roommailbox',
+      regular: 'usermailbox',
+    };
+    const want = TARGET[String(mailboxType).toLowerCase()];
+
+    return (await this.verifyWrite({
+      run: () =>
+        this.request('POST', 'ExecConvertMailbox', undefined, {
+          tenantFilter,
+          ID: id,
+          MailboxType: mailboxType,
+        }),
+      verifiedBy: 'recipientTypeDetails',
+      readback: async () => {
+        if (!want) return false; // unknown target type — cannot assert, stay honest
+        const rows = await this.request<Array<{ recipientTypeDetails?: unknown }>>(
+          'GET',
+          'ListMailboxes',
+          { tenantFilter, Identity: id }
+        );
+        const row = (Array.isArray(rows) ? rows : [])[0];
+        const rtd =
+          typeof row?.recipientTypeDetails === 'string'
+            ? row.recipientTypeDetails.toLowerCase()
+            : '';
+        return rtd === want;
+      },
+      // CIPP's mailbox cache lags ~1 refresh after a convert (observed live
+      // 2026-07-25), so give the readback a longer budget than a directory write.
+      timeoutMs: 60_000,
+      successMessage: `Mailbox ${id} confirmed as ${mailboxType} in ${tenantFilter} (recipientTypeDetails=${want}).`,
+      recheckMessage: `CIPP accepted ExecConvertMailbox for ${id} -> ${mailboxType}, but recipientTypeDetails was not observed as ${want ?? mailboxType} within the verification window (its mailbox cache can lag a refresh). Re-check with cipp_list_mailboxes before confirming.`,
+    })) as T;
   }
 
   /**
