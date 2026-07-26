@@ -1740,6 +1740,11 @@ export class CippService {
       const isService = /^NT SERVICE\\/i.test(who);
       const isHousekeeping = isService && /DiscoverySearchMailbox/i.test(obj);
       if (!isHousekeeping && /\b(FullAccess|SendAs|SendOnBehalf)\b/i.test(perms)) {
+        // Restored: Copilot Autofix dropped this line in #11, which left a
+        // delegation grant pushing a reason without ever raising severity —
+        // and severity `info` emits no alert at all. Silent pass on the most
+        // direct BEC persistence move. Guarded by the bec-threshold suite.
+        critical = true;
         reasons.push(
           `${String(p.Operation ?? 'permission change')}: ${who} granted ${perms} on ${String(p.ObjectId ?? '?')}`
         );
