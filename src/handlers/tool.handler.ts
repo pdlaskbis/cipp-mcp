@@ -195,17 +195,35 @@ export class CippToolHandler {
         }
 
         case 'cipp_bec_check': {
-          const { tenantFilter, userId, useCached, maxAttempts, intervalMs } = args as {
+          const {
+            tenantFilter,
+            userId,
+            useCached,
+            maxAttempts,
+            intervalMs,
+            knownAppIds,
+            knownIPs,
+          } = args as {
             tenantFilter: string;
             userId: string;
             useCached?: boolean;
             maxAttempts?: number;
             intervalMs?: number;
+            knownAppIds?: string[];
+            knownIPs?: string[];
           };
           result = await this.cippService.becCheck(tenantFilter, userId, {
             ...(useCached !== undefined ? { useCached } : {}),
             ...(maxAttempts !== undefined ? { maxAttempts } : {}),
             ...(intervalMs !== undefined ? { intervalMs } : {}),
+            ...(knownAppIds !== undefined || knownIPs !== undefined
+              ? {
+                  baseline: {
+                    ...(knownAppIds !== undefined ? { knownAppIds } : {}),
+                    ...(knownIPs !== undefined ? { knownIPs } : {}),
+                  },
+                }
+              : {}),
           });
           break;
         }

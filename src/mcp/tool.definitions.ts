@@ -402,6 +402,21 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           type: 'number',
           description: 'Milliseconds between poll attempts. Defaults to 10000.',
         },
+        knownAppIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Application IDs already known-good in this tenant. Suppresses the "new application ' +
+            'registered" warning for apps deployed intentionally.',
+        },
+        knownIPs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Source IPs already known-good for this tenant (office egress, automation, VPN). ' +
+            'Successful sign-ins from these are not flagged. Failed sign-ins are never flagged ' +
+            'regardless, since they are password-spray noise.',
+        },
       },
       required: ['tenantFilter', 'userId'],
     },
