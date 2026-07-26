@@ -598,7 +598,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           description:
             'Trace the last N days. Convenience for a rolling window; takes precedence ' +
             'over startDate/endDate when both are given. Exchange retains ~10 days of trace.',
-        }
+        },
         startDate: {
           type: 'string',
           description:
