@@ -449,6 +449,23 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_list_signin_logs': {
+          const { tenantFilter, days, failedLogonsOnly, failureThreshold, filter } = args as {
+            tenantFilter: string;
+            days?: number;
+            failedLogonsOnly?: boolean;
+            failureThreshold?: number;
+            filter?: string;
+          };
+          const signInParams: Record<string, unknown> = {};
+          if (days !== undefined) signInParams.days = days;
+          if (failedLogonsOnly !== undefined) signInParams.failedLogonsOnly = failedLogonsOnly;
+          if (failureThreshold !== undefined) signInParams.failureThreshold = failureThreshold;
+          if (filter !== undefined) signInParams.filter = filter;
+          result = await this.cippService.listSignIns(tenantFilter, signInParams);
+          break;
+        }
+
         case 'cipp_list_alert_queue': {
           result = await this.cippService.listAlertQueue();
           break;
