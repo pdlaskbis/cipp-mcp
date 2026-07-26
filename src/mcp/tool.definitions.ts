@@ -890,6 +890,62 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_list_signin_logs',
+    description:
+      'List Entra ID (Azure AD) sign-in log entries for a tenant. Read-only. ' +
+      'Each row includes userPrincipalName, appDisplayName, ipAddress, ' +
+      'createdDateTime, conditionalAccessStatus, the resolved errorCode, and a ' +
+      'human-readable location (locationcipp). Use this to make sign-in patterns ' +
+      'visible — e.g. failed auths from unfamiliar source IPs — that a coarse ' +
+      '"failed logon" filter would otherwise bury as password-spray noise. ' +
+      'failedLogonsOnly narrows to bad-password failures only (error 50126); for ' +
+      'ANY other failure class (Conditional-Access blocked, MFA denied, failed ' +
+      'Azure Resource Manager auth) pass a raw OData filter instead. Supports ' +
+      "'allTenants'.",
+    annotations: {
+      title: 'List Entra sign-in logs',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        days: {
+          type: 'number',
+          description:
+            'Look back this many days (builds `createdDateTime ge <date>`). ' +
+            'Defaults to 7 server-side when omitted. Ignored when filter is set.',
+        },
+        failedLogonsOnly: {
+          type: 'boolean',
+          description:
+            'When true, return only bad-password failures (error code 50126). ' +
+            'Does NOT include other failure codes — for CA-blocked, MFA-denied, ' +
+            'or failed Azure Resource Manager auths use the raw filter instead.',
+        },
+        failureThreshold: {
+          type: 'number',
+          description:
+            'Only meaningful with failedLogonsOnly: keep only users with at least ' +
+            'this many failed logons (groups by userPrincipalName). Surfaces ' +
+            'password-spray targets. Ignored without failedLogonsOnly.',
+        },
+        filter: {
+          type: 'string',
+          description:
+            'Raw Microsoft Graph OData $filter over /auditLogs/signIns. When set ' +
+            'it REPLACES the day/failed-logon predicate entirely — the power tool ' +
+            "for targeted hunts, e.g. \"status/errorCode ne 0\", " +
+            "\"appDisplayName eq 'Azure Resource Manager'\", or \"ipAddress eq '203.0.113.5'\".",
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
     name: 'cipp_list_alert_queue',
     description: 'List queued alerts across all tenants',
     inputSchema: {
@@ -1343,7 +1399,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_list_domain_health',
   ],
   licenses: ['cipp_list_licenses', 'cipp_list_csp_licenses'],
-  alerts: ['cipp_list_audit_logs', 'cipp_list_alert_queue'],
+  alerts: ['cipp_list_audit_logs', 'cipp_list_signin_logs', 'cipp_list_alert_queue'],
   gdap: ['cipp_list_gdap_roles', 'cipp_list_gdap_invites'],
   scheduler: ['cipp_list_scheduled_items', 'cipp_add_scheduled_item'],
   core: ['cipp_ping', 'cipp_get_version', 'cipp_list_logs'],

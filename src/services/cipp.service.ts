@@ -1325,6 +1325,58 @@ export class CippService {
   }
 
   /**
+   * List Entra ID (Azure AD) sign-in log entries for a tenant. Read-only.
+   * Calls the `ListSignIns` Azure Function.
+   *
+   * CONTRACT (verified against KelvinTegelaar/CIPP-API tag 10.7.0,
+   * Invoke-ListSignIns.ps1 — role Identity.AuditLog.Read):
+   *
+   *   GET; CIPP reads everything from `$Request.Query.*`. It queries Graph beta
+   *   /auditLogs/signIns and returns each row augmented with `errorCode`
+   *   (status.errorCode), `additionalDetails` (status.additionalDetails) and
+   *   `locationcipp` ("city - countryOrRegion"). The payload is a JSON array.
+   *
+   *   Query fields CIPP reads (exact casing — sent verbatim, so the casing here
+   *   matters even though Azure Functions query access is case-insensitive):
+   *     tenantFilter       required; 'allTenants' is supported.
+   *     Days               integer; server default 7. Builds
+   *                        `createdDateTime ge <UTC date>`.
+   *     failedLogonsOnly   'true' appends `and (status/errorCode eq 50126)`.
+   *                        50126 is bad-password ONLY — this does NOT capture
+   *                        other failure codes (CA-blocked, MFA-denied, failed
+   *                        Azure Resource Manager auth, etc.). For those, pass a
+   *                        raw `filter` instead.
+   *     FailureThreshold   with failedLogonsOnly, groups by userPrincipalName and
+   *                        keeps only users with >= N failures (password-spray
+   *                        shape). Ignored without failedLogonsOnly.
+   *     Filter             raw OData $filter. When set it REPLACES the default
+   *                        date / failed-logon predicate entirely — the power
+   *                        tool for "failed ARM auth from an unfamiliar IP" hunts
+   *                        (e.g. `status/errorCode ne 0`, `appDisplayName eq
+   *                        'Azure Resource Manager'`, `ipAddress eq '...'`).
+   *
+   * @param tenantFilter - Tenant domain or identifier.
+   * @param params       - Optional sign-in filters (see contract above).
+   */
+  async listSignIns<T = unknown>(
+    tenantFilter: string,
+    params?: {
+      days?: number;
+      failedLogonsOnly?: boolean;
+      failureThreshold?: number;
+      filter?: string;
+    }
+  ): Promise<T> {
+    const p = params ?? {};
+    const query: Record<string, unknown> = { tenantFilter };
+    if (p.days !== undefined) query.Days = p.days;
+    if (p.failedLogonsOnly !== undefined) query.failedLogonsOnly = p.failedLogonsOnly;
+    if (p.failureThreshold !== undefined) query.FailureThreshold = p.failureThreshold;
+    if (p.filter !== undefined) query.Filter = p.filter;
+    return this.request<T>('GET', 'ListSignIns', query);
+  }
+
+  /**
    * Retrieve the current CIPP alert queue.
    * Calls the `ListAlertsQueue` Azure Function.
    */
