@@ -774,7 +774,7 @@ export class CippService {
       const resultObj = (findings ?? {}) as Record<string, unknown>;
       const extractResult = String(resultObj.ExtractResult ?? '');
       const extractedAt = String(resultObj.ExtractedAt ?? '');
-      const extractOk = /success/i.test(extractResult);
+      const extractOk = /\bsuccess/i.test(extractResult);
 
       const assessment = this.assessBecFindings(resultObj, options?.baseline);
 
