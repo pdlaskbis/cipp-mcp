@@ -989,6 +989,99 @@ export class CippService {
   }
 
   /**
+   * Trace Exchange Online message delivery for a tenant — metadata only,
+   * never message bodies. Calls the `ListMessageTrace` Azure Function.
+   *
+   * CONTRACT (verified against KelvinTegelaar/CIPP-API tag 10.7.0,
+   * Invoke-ListMessageTrace.ps1 — role Exchange.Mailbox.Read):
+   *
+   *   It is a POST; CIPP reads EVERYTHING from `$Request.Body.*`, nothing from
+   *   the query string. The body is mapped onto Get-MessageTraceV2 CmdParams and
+   *   the function returns, per message: MessageTraceId, Status, Subject,
+   *   RecipientAddress, SenderAddress, Received (UTC 'u' string), FromIP, ToIP.
+   *   The payload is a JSON array (CIPP wraps it as `@($Trace)`).
+   *
+   *   Body fields CIPP actually reads:
+   *     tenantFilter                required.
+   *     messageId                   if set, an ID-only search — CIPP ignores the
+   *                                 date / status / IP filters in this mode.
+   *     days                        integer; last N days. Takes precedence over
+   *                                 startDate/endDate.
+   *     startDate / endDate         unix-epoch-seconds string OR
+   *                                 'yyyy-MM-ddTHH:mm:ssZ'.
+   *     status                      read as `status.value`, so it MUST be wrapped
+   *                                 as { value }; a bare string silently no-ops.
+   *     fromIP / toIP               source / destination IP.
+   *     recipient / sender          read as `x.value ?? x`, so a plain string is
+   *                                 accepted; only these two apply in messageId mode.
+   *
+   *   `subjectContains` is NOT a CIPP parameter — the endpoint has no server-side
+   *   subject filter. It is therefore NEVER sent; when supplied it is applied
+   *   client-side against the returned Subject. (Sending fields CIPP does not read
+   *   is the exact contract failure this connector keeps fixing.)
+   *
+   *   `traceDetail` + `ID` (per-message event detail via Get-MessageTraceDetailV2)
+   *   is a deliberately-unexposed second mode; add a separate tool if it's needed.
+   *
+   * Metadata only by design: trace never returns message bodies. Body retrieval
+   * (Defender quarantine / Graph Mail.Read / Purview Content Search) is a heavier
+   * permission conversation and out of scope here.
+   *
+   * @param tenantFilter - Tenant domain or identifier.
+   * @param params       - Optional trace filters (see contract above).
+   */
+  async listMessageTrace<T = unknown>(
+    tenantFilter: string,
+    params?: {
+      sender?: string;
+      recipient?: string;
+      startDate?: string;
+      endDate?: string;
+      days?: number;
+      status?: string;
+      fromIP?: string;
+      toIP?: string;
+      messageId?: string;
+      subjectContains?: string;
+    }
+  ): Promise<T> {
+    const p = params ?? {};
+    const body: Record<string, unknown> = { tenantFilter };
+
+    if (p.messageId !== undefined) {
+      // ID-only search: CIPP ignores every date / status / IP filter here.
+      body.messageId = p.messageId;
+    } else {
+      if (p.days !== undefined) {
+        body.days = p.days;
+      } else {
+        if (p.startDate !== undefined) body.startDate = p.startDate;
+        if (p.endDate !== undefined) body.endDate = p.endDate;
+      }
+      // CIPP reads `status.value`; wrap so the filter is not silently dropped.
+      if (p.status !== undefined) body.status = { value: p.status };
+      if (p.fromIP !== undefined) body.fromIP = p.fromIP;
+      if (p.toIP !== undefined) body.toIP = p.toIP;
+    }
+    // recipient/sender apply in both modes; CIPP does `x.value ?? x`.
+    if (p.recipient !== undefined) body.recipient = p.recipient;
+    if (p.sender !== undefined) body.sender = p.sender;
+
+    const trace = await this.request<T>('POST', 'ListMessageTrace', undefined, body);
+
+    // subjectContains has no server-side equivalent — filter the returned rows.
+    if (p.subjectContains && Array.isArray(trace)) {
+      const needle = p.subjectContains.toLowerCase();
+      return (trace as unknown[]).filter((row) => {
+        const subject = (row as { Subject?: unknown }).Subject;
+        return typeof subject === 'string' && subject.toLowerCase().includes(needle);
+      }) as unknown as T;
+    }
+
+    return trace;
+  }
+
+  /**
    * Configure an out-of-office auto-reply for a mailbox.
    * Calls the `ExecSetOoO` Azure Function.
    *

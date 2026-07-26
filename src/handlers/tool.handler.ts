@@ -304,6 +304,47 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_message_trace': {
+          const {
+            tenantFilter,
+            sender,
+            recipient,
+            days,
+            startDate,
+            endDate,
+            status,
+            fromIP,
+            toIP,
+            messageId,
+            subjectContains,
+          } = args as {
+            tenantFilter: string;
+            sender?: string;
+            recipient?: string;
+            days?: number;
+            startDate?: string;
+            endDate?: string;
+            status?: string;
+            fromIP?: string;
+            toIP?: string;
+            messageId?: string;
+            subjectContains?: string;
+          };
+          const traceParams: Record<string, unknown> = {};
+          if (sender !== undefined) traceParams.sender = sender;
+          if (recipient !== undefined) traceParams.recipient = recipient;
+          if (days !== undefined) traceParams.days = days;
+          if (startDate !== undefined) traceParams.startDate = startDate;
+          if (endDate !== undefined) traceParams.endDate = endDate;
+          if (status !== undefined) traceParams.status = status;
+          if (fromIP !== undefined) traceParams.fromIP = fromIP;
+          if (toIP !== undefined) traceParams.toIP = toIP;
+          if (messageId !== undefined) traceParams.messageId = messageId;
+          if (subjectContains !== undefined) traceParams.subjectContains = subjectContains;
+          result = await this.cippService.listMessageTrace(tenantFilter, traceParams);
+          break;
+        }
+
         case 'cipp_set_out_of_office': {
           const { tenantFilter, upn, enabled, internalMessage, externalMessage } = args as {
             tenantFilter: string;
