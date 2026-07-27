@@ -584,10 +584,20 @@ export class CippService {
    * @param userId       - Azure AD object ID of the user.
    */
   async resetMFA<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecResetMFA', undefined, {
+    // CONTRACT (KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ExecResetMFA.ps1):
+    // synchronous — it calls Remove-CIPPUserMFA inline and returns HTTP 500 on
+    // failure, so a 2xx here means the auth methods were removed in Microsoft.
+    // No independent readback (ListMFAUsers is a whole-tenant, cache-backed
+    // report), so we verify from the synchronous result.
+    const submission = await this.request<{ Results?: unknown }>('POST', 'ExecResetMFA', undefined, {
       tenantFilter,
       ID: userId,
     });
+    return this.resultEnvelope(submission, {
+      verifiedBy: 'ExecResetMFA result (Remove-CIPPUserMFA, synchronous)',
+      successMessage: `MFA methods reset for ${userId} in ${tenantFilter} (CIPP completed the removal synchronously). The user must re-register MFA at next sign-in.`,
+      recheckMessage: `CIPP returned without a clear success for ExecResetMFA on ${userId}. Re-check the user's authentication methods in the CIPP MFA report before confirming.`,
+    }) as T;
   }
 
   /**
@@ -609,7 +619,25 @@ export class CippService {
     const resolvedUsername = username ?? (userId.includes('@') ? userId : undefined);
     const body: Record<string, unknown> = { tenantFilter, ID: userId };
     if (resolvedUsername) body.Username = resolvedUsername;
-    return this.request<T>('POST', 'ExecRevokeSessions', undefined, body);
+
+    // CONTRACT (KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ExecRevokeSessions.ps1):
+    // synchronous — calls Revoke-CIPPSessions inline and returns HTTP 500 on
+    // failure, so a 2xx means Graph's revokeSignInSessions completed. There is no
+    // independent readback: signInSessionsValidFromDateTime is NOT returned by any
+    // CIPP read (not in the ListUsers select), so we verify from the synchronous
+    // result rather than fake a readback.
+    const who = resolvedUsername ?? userId;
+    const submission = await this.request<{ Results?: unknown }>(
+      'POST',
+      'ExecRevokeSessions',
+      undefined,
+      body
+    );
+    return this.resultEnvelope(submission, {
+      verifiedBy: 'ExecRevokeSessions result (revokeSignInSessions, synchronous)',
+      successMessage: `Sign-in sessions revoked for ${who} in ${tenantFilter} (Graph revokeSignInSessions completed synchronously).`,
+      recheckMessage: `CIPP returned without a clear success for ExecRevokeSessions on ${who}.`,
+    }) as T;
   }
 
   /**
@@ -1185,7 +1213,21 @@ export class CippService {
       body.ExternalMessage = oooData.externalMessage;
     }
 
-    return this.request<T>('POST', 'ExecSetOoO', undefined, body);
+    // ExecSetOoO is synchronous (Set-MailboxAutoReplyConfiguration inline) and
+    // returns HTTP 500 on failure — a 2xx means the state was applied. Verify from
+    // the synchronous result rather than a slow per-mailbox OoO read.
+    const wantState = body.AutoReplyState as string;
+    const submission = await this.request<{ Results?: unknown }>(
+      'POST',
+      'ExecSetOoO',
+      undefined,
+      body
+    );
+    return this.resultEnvelope(submission, {
+      verifiedBy: 'ExecSetOoO result (Set-MailboxAutoReplyConfiguration, synchronous)',
+      successMessage: `Out-of-office set to ${wantState} for ${upn} in ${tenantFilter} (CIPP applied it synchronously).`,
+      recheckMessage: `CIPP returned without a clear success for ExecSetOoO on ${upn} (a failed payload shows a blank name in the error). Re-check the mailbox auto-reply state before confirming.`,
+    }) as T;
   }
 
   /**
@@ -1860,8 +1902,17 @@ export class CippService {
           return c.op === 'add' ? present : !present;
         });
       },
-      // Exchange permission changes propagate with a lag (observed live).
-      timeoutMs: 60_000,
+      // The readback (ListmailboxPermissions = Get-Mailbox + Get-MailboxPermission
+      // + Get-RecipientPermission) is a slow chained-EXO call, and a *grant*
+      // propagates with a lag. A 60s inline poll outlived the MCP gateway
+      // tool-call deadline and timed out instead of returning an envelope
+      // (observed live 2026-07-27: a remove verifies fast; an add can outlast the
+      // window). Keep the poll budget short so the tool always RETURNS — an add
+      // whose grant hasn't landed yet comes back verified:false + recheck (the
+      // write is already submitted), which is honest, not a hang. Tune down
+      // further if a gateway timeout ever recurs here.
+      timeoutMs: 20_000,
+      intervalMs: 6_000,
       successMessage: `Mailbox permission change on ${userId} in ${tenantFilter} confirmed via readback.`,
       recheckMessage: `CIPP accepted ExecEditMailboxPermissions for ${userId}, but the change was not confirmed on the mailbox within the verification window (Exchange permission changes can lag). Re-check with cipp_list_mailbox_permissions before confirming.`,
     })) as T;
@@ -2176,6 +2227,48 @@ export class CippService {
    * Uses ListUsers' UserID / graphFilter params (the only two Invoke-ListUsers
    * actually reads) so this costs one narrow lookup, not a tenant dump.
    */
+  /**
+   * Verify a SYNCHRONOUS CIPP operation from its own result, for the cases where
+   * an independent readback isn't available or isn't worth a slow poll.
+   *
+   * This is honest ONLY for synchronous operations — ones where CIPP runs the
+   * Graph/EXO call inline and returns after it completes, and returns HTTP 500
+   * (which {@link request} throws on) if it fails. For those, reaching this code
+   * already means a 2xx, i.e. the operation completed in Microsoft. We still scan
+   * `Results` for failure language, because some CIPP inner functions swallow
+   * errors and report them as a success-status string (the Set-CIPPUser trap).
+   *
+   * Do NOT use this for ASYNC endpoints that return 200 on job ACCEPTANCE
+   * (AddUser, ExecOffboardUser, …) — those need a readback via {@link verifyWrite}.
+   */
+  private resultEnvelope(
+    submission: unknown,
+    opts: { verifiedBy: string; successMessage: string; recheckMessage: string }
+  ): VerifiedWriteEnvelope {
+    const raw = (submission as { Results?: unknown } | undefined)?.Results;
+    const results = (Array.isArray(raw) ? raw : [raw])
+      .filter((r) => r !== undefined && r !== null)
+      .map((r) => (typeof r === 'string' ? r : JSON.stringify(r)));
+    const failed = results.some((r) =>
+      /\b(fail(ed)?|error|could ?not|couldn'?t|unable|not found|denied|forbidden|exception|invalid)\b/i.test(
+        r
+      )
+    );
+    // 2xx already reached here (request throws on non-2xx); treat a non-failing
+    // result as the completed operation. Empty Results is inconclusive → recheck.
+    const verified = !failed && results.length > 0;
+    return {
+      status: verified ? 'verified' : 'unverified',
+      verified,
+      verifiedBy: opts.verifiedBy,
+      recheck: verified ? null : { instruction: opts.recheckMessage },
+      message: verified
+        ? opts.successMessage
+        : `${opts.recheckMessage} Do NOT report success until confirmed.`,
+      submission,
+    };
+  }
+
   /**
    * Run a mutating CIPP call, then poll a Microsoft-side readback until it
    * confirms the change landed — returning the {@link VerifiedWriteEnvelope}.
