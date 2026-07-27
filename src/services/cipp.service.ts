@@ -1860,8 +1860,17 @@ export class CippService {
           return c.op === 'add' ? present : !present;
         });
       },
-      // Exchange permission changes propagate with a lag (observed live).
-      timeoutMs: 60_000,
+      // The readback (ListmailboxPermissions = Get-Mailbox + Get-MailboxPermission
+      // + Get-RecipientPermission) is a slow chained-EXO call, and a *grant*
+      // propagates with a lag. A 60s inline poll outlived the MCP gateway
+      // tool-call deadline and timed out instead of returning an envelope
+      // (observed live 2026-07-27: a remove verifies fast; an add can outlast the
+      // window). Keep the poll budget short so the tool always RETURNS — an add
+      // whose grant hasn't landed yet comes back verified:false + recheck (the
+      // write is already submitted), which is honest, not a hang. Tune down
+      // further if a gateway timeout ever recurs here.
+      timeoutMs: 20_000,
+      intervalMs: 6_000,
       successMessage: `Mailbox permission change on ${userId} in ${tenantFilter} confirmed via readback.`,
       recheckMessage: `CIPP accepted ExecEditMailboxPermissions for ${userId}, but the change was not confirmed on the mailbox within the verification window (Exchange permission changes can lag). Re-check with cipp_list_mailbox_permissions before confirming.`,
     })) as T;
