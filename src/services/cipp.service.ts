@@ -1966,7 +1966,38 @@ export class CippService {
         }))
       );
     }
-    return this.request<T>('POST', 'EditGroup', undefined, body);
+
+    const adds = (addMembers ?? []).filter((u) => u && u.trim() !== '');
+    const removes = (removeMembers ?? []).filter((u) => u && u.trim() !== '');
+    const wantId = groupId.toLowerCase();
+
+    // Confirm membership from the MEMBER's side. Verified against
+    // KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListUserGroups.ps1: it lists a
+    // user's group memberships and returns each group's object `id`, so we check
+    // whether the member now is (add) / is not (remove) in this group.
+    const memberInGroup = async (member: string): Promise<boolean> => {
+      const groups = await this.listUserGroups<Array<{ id?: unknown }>>(tenantFilter, member);
+      return (Array.isArray(groups) ? groups : []).some(
+        (g) => typeof g?.id === 'string' && g.id.toLowerCase() === wantId
+      );
+    };
+
+    return (await this.verifyWrite({
+      run: () => this.request('POST', 'EditGroup', undefined, body),
+      verifiedBy: 'groupMembership',
+      readback: async () => {
+        if (adds.length === 0 && removes.length === 0) return false; // nothing to confirm
+        const results = await Promise.all([
+          ...adds.map((m) => memberInGroup(m).then((has) => has === true)),
+          ...removes.map((m) => memberInGroup(m).then((has) => has === false)),
+        ]);
+        return results.every(Boolean);
+      },
+      // Directory membership changes propagate with a short lag.
+      timeoutMs: 45_000,
+      successMessage: `Group membership change on ${groupId} in ${tenantFilter} confirmed (${adds.length} add, ${removes.length} remove).`,
+      recheckMessage: `CIPP accepted EditGroup for ${groupId}, but the membership change was not confirmed within the verification window (directory changes can lag). Re-check with cipp_list_user_groups before confirming.`,
+    })) as T;
   }
 
   // -------------------------------------------------------------------------
