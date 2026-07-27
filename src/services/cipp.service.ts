@@ -1244,7 +1244,48 @@ export class CippService {
       }
     }
 
-    return this.request<T>('POST', 'ExecEmailForward', undefined, body);
+    // Readback via the scoped mailbox read. Verified against
+    // KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListMailboxes.ps1: it returns
+    // `ForwardingSmtpAddress` (smtp: prefix already stripped) for an external
+    // forward and `InternalForwardingAddress` for an internal one, and accepts
+    // an `Identity` filter so the read is scoped to this mailbox.
+    const mode = body.forwardOption as string;
+    const wantExternal = forwardTo.toLowerCase();
+
+    return (await this.verifyWrite({
+      run: () => this.request('POST', 'ExecEmailForward', undefined, body),
+      verifiedBy: mode === 'internalAddress' ? 'ForwardingAddress' : 'ForwardingSmtpAddress',
+      readback: async () => {
+        const rows = await this.request<
+          Array<{ ForwardingSmtpAddress?: unknown; InternalForwardingAddress?: unknown }>
+        >('GET', 'ListMailboxes', { tenantFilter, Identity: upn });
+        const row = (Array.isArray(rows) ? rows : [])[0] ?? {};
+        const smtp =
+          typeof row.ForwardingSmtpAddress === 'string'
+            ? row.ForwardingSmtpAddress.toLowerCase()
+            : '';
+        const internal =
+          typeof row.InternalForwardingAddress === 'string'
+            ? row.InternalForwardingAddress.trim()
+            : '';
+        if (mode === 'disabled') return smtp === '' && internal === '';
+        if (mode === 'ExternalAddress') return smtp === wantExternal;
+        // internalAddress: CIPP resolves the recipient, and the read exposes it
+        // as a display value rather than the SMTP we sent — so confirm an
+        // internal forward is now set (non-empty) rather than string-matching.
+        return internal !== '';
+      },
+      timeoutMs: 45_000,
+      successMessage:
+        mode === 'disabled'
+          ? `Forwarding disabled on ${upn} in ${tenantFilter} (no forwarding address confirmed).`
+          : `Forwarding on ${upn} in ${tenantFilter} confirmed (${
+              mode === 'internalAddress'
+                ? 'internal recipient set'
+                : `ForwardingSmtpAddress=${forwardTo}`
+            }).`,
+      recheckMessage: `CIPP accepted ExecEmailForward for ${upn}, but the forwarding state was not confirmed within the verification window. Re-check with cipp_list_mailboxes before confirming.`,
+    })) as T;
   }
 
   // -------------------------------------------------------------------------
@@ -1774,7 +1815,56 @@ export class CippService {
         body[bucket] = { value: users };
       }
     }
-    return this.request<T>('POST', 'ExecEditMailboxPermissions', undefined, body);
+
+    // Each bucket maps to the permission keyword + direction we must confirm.
+    // Readback shape verified LIVE 2026-07-26 against askbis.com: CIPP's
+    // ListmailboxPermissions returns { User, Permissions } where User is the
+    // delegate UPN (exact) and Permissions is a STRING ('FullAccess,
+    // ReadPermission') from Get-MailboxPermission or an ARRAY (['SendAs']) from
+    // Get-RecipientPermission. NT AUTHORITY\SELF rows are the mailbox's own
+    // defaults and are ignored. Grants propagate with a lag, so the readback polls.
+    const BUCKET_META: Record<string, { op: 'add' | 'remove'; kw: string }> = {
+      AddFullAccess: { op: 'add', kw: 'fullaccess' },
+      RemoveFullAccess: { op: 'remove', kw: 'fullaccess' },
+      AddSendAs: { op: 'add', kw: 'sendas' },
+      RemoveSendAs: { op: 'remove', kw: 'sendas' },
+      AddSendOnBehalf: { op: 'add', kw: 'sendonbehalf' },
+      RemoveSendOnBehalf: { op: 'remove', kw: 'sendonbehalf' },
+    };
+    const checks: Array<{ user: string; op: 'add' | 'remove'; kw: string }> = [];
+    for (const [bucket, users] of Object.entries(buckets)) {
+      const meta = BUCKET_META[bucket];
+      if (!meta || !users) continue;
+      for (const u of users) checks.push({ user: u.toLowerCase(), op: meta.op, kw: meta.kw });
+    }
+
+    const permText = (p: unknown): string =>
+      (Array.isArray(p) ? p.join(', ') : String(p ?? '')).toLowerCase();
+
+    return (await this.verifyWrite({
+      run: () => this.request('POST', 'ExecEditMailboxPermissions', undefined, body),
+      verifiedBy: 'mailboxPermissions',
+      readback: async () => {
+        if (checks.length === 0) return false; // no recognised buckets — cannot assert
+        const rows = await this.listMailboxPermissions<
+          Array<{ User?: unknown; Permissions?: unknown }>
+        >(tenantFilter, userId);
+        const grants = (Array.isArray(rows) ? rows : [])
+          .filter((r) => typeof r.User === 'string' && !/^NT AUTHORITY\\/i.test(r.User))
+          .map((r) => ({
+            user: (r.User as string).toLowerCase(),
+            perms: permText(r.Permissions),
+          }));
+        return checks.every((c) => {
+          const present = grants.some((g) => g.user === c.user && g.perms.includes(c.kw));
+          return c.op === 'add' ? present : !present;
+        });
+      },
+      // Exchange permission changes propagate with a lag (observed live).
+      timeoutMs: 60_000,
+      successMessage: `Mailbox permission change on ${userId} in ${tenantFilter} confirmed via readback.`,
+      recheckMessage: `CIPP accepted ExecEditMailboxPermissions for ${userId}, but the change was not confirmed on the mailbox within the verification window (Exchange permission changes can lag). Re-check with cipp_list_mailbox_permissions before confirming.`,
+    })) as T;
   }
 
   /**
@@ -1876,7 +1966,38 @@ export class CippService {
         }))
       );
     }
-    return this.request<T>('POST', 'EditGroup', undefined, body);
+
+    const adds = (addMembers ?? []).filter((u) => u && u.trim() !== '');
+    const removes = (removeMembers ?? []).filter((u) => u && u.trim() !== '');
+    const wantId = groupId.toLowerCase();
+
+    // Confirm membership from the MEMBER's side. Verified against
+    // KelvinTegelaar/CIPP-API tag 10.7.0, Invoke-ListUserGroups.ps1: it lists a
+    // user's group memberships and returns each group's object `id`, so we check
+    // whether the member now is (add) / is not (remove) in this group.
+    const memberInGroup = async (member: string): Promise<boolean> => {
+      const groups = await this.listUserGroups<Array<{ id?: unknown }>>(tenantFilter, member);
+      return (Array.isArray(groups) ? groups : []).some(
+        (g) => typeof g?.id === 'string' && g.id.toLowerCase() === wantId
+      );
+    };
+
+    return (await this.verifyWrite({
+      run: () => this.request('POST', 'EditGroup', undefined, body),
+      verifiedBy: 'groupMembership',
+      readback: async () => {
+        if (adds.length === 0 && removes.length === 0) return false; // nothing to confirm
+        const results = await Promise.all([
+          ...adds.map((m) => memberInGroup(m).then((has) => has === true)),
+          ...removes.map((m) => memberInGroup(m).then((has) => has === false)),
+        ]);
+        return results.every(Boolean);
+      },
+      // Directory membership changes propagate with a short lag.
+      timeoutMs: 45_000,
+      successMessage: `Group membership change on ${groupId} in ${tenantFilter} confirmed (${adds.length} add, ${removes.length} remove).`,
+      recheckMessage: `CIPP accepted EditGroup for ${groupId}, but the membership change was not confirmed within the verification window (directory changes can lag). Re-check with cipp_list_user_groups before confirming.`,
+    })) as T;
   }
 
   // -------------------------------------------------------------------------
