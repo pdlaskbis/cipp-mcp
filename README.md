@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for [CIPP](https://github.com/KelvinTegelaar
 
 ## Features
 
-- **37 tools** across 11 categories
+- **56 tools** across 13 categories
 - Tenant, user, group, and mailbox management
 - Security: Conditional Access policies, named locations
 - Standards & compliance: BPA, domain health, drift detection
@@ -92,14 +92,14 @@ Add to your `claude_desktop_config.json`:
 | Category | Tools |
 |---|---|
 | Tenants | list_tenants, get_tenant_details |
-| Users | list_users, create_user, edit_user, disable_user, reset_password, reset_mfa, revoke_sessions, offboard_user, bec_check, list_mfa_users, list_user_devices, list_user_groups |
-| Groups | list_groups, create_group |
+| Users | list_users, create_user, edit_user, disable_user, reset_password, reset_mfa, revoke_sessions, set_per_user_mfa, offboard_user, bec_check, list_mfa_users, list_user_devices, list_user_groups |
+| Groups | list_groups, list_group_members, create_group, edit_group_members |
 | Mailboxes | list_mailboxes, list_mailbox_permissions, set_out_of_office, set_email_forwarding |
 | Security | list_conditional_access_policies, list_named_locations |
 | Standards | list_standards, run_standards_check, list_bpa, list_domain_health |
 | Licenses | list_licenses, list_csp_licenses |
 | Alerts | list_audit_logs, list_alert_queue |
-| GDAP | list_gdap_roles, list_gdap_invites |
+| GDAP | list_gdap_roles, list_gdap_invites, exec_gdap_invite |
 | Scheduler | list_scheduled_items, add_scheduled_item |
 | Core | ping, get_version, list_logs |
 
