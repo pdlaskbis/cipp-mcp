@@ -80,6 +80,43 @@ export interface VerifiedWriteEnvelope {
   submission: unknown;
 }
 
+export type PerUserMfaState = 'disabled' | 'enabled' | 'enforced';
+const PER_USER_MFA_STATES: PerUserMfaState[] = ['disabled', 'enabled', 'enforced'];
+
+/** One member row returned by {@link CippService.listGroupMembers}. */
+export interface GroupMember {
+  id: string | null;
+  displayName: string | null;
+  userPrincipalName: string | null;
+  mail: string | null;
+  /** Graph object type without the namespace (user, group, device, ...). */
+  type: string | null;
+}
+
+export interface GroupMembersResult {
+  tenantFilter: string;
+  groupId: string;
+  groupName: string | null;
+  memberCount: number;
+  members: GroupMember[];
+}
+
+/** A GDAP role mapping as listed by `ListGDAPRoles` (UNVERIFIED field casing). */
+export interface GdapRoleMapping {
+  roleDefinitionId: string;
+  GroupId?: string;
+  GroupName?: string;
+  RoleName?: string;
+}
+
+/** Envelope for {@link CippService.execGDAPInvite}: the write envelope plus the invite links. */
+export interface GdapInviteResult extends VerifiedWriteEnvelope {
+  inviteUrl: string | null;
+  onboardingUrl: string | null;
+  relationshipId: string | null;
+  roleMappings: GdapRoleMapping[];
+}
+
 /**
  * HTTP client for the CIPP Azure Function App API.
  *
@@ -641,6 +678,78 @@ export class CippService {
   }
 
   /**
+   * Set a user's legacy per-user MFA state (disabled / enabled / enforced).
+   * Calls the `ExecPerUserMFA` Azure Function (CIPP's Set-CIPPPerUserMFA).
+   *
+   * UNVERIFIED against upstream — confirm before deploy. Body shape assumed:
+   * `{ tenantFilter, userId, userPrincipalName, State }`. CIPP's UI posts the
+   * user's UPN, and the endpoint is believed to key off `userPrincipalName`
+   * (falling back to `userId` for #EXT# guests), so both are sent: a body
+   * carrying only `userId` risks CIPP patching a blank user id while still
+   * returning a success string.
+   *
+   * Readback (also UNVERIFIED): `ListPerUserMFA?tenantFilter&userId` is assumed
+   * to return `[{ PerUserMFAState, UserPrincipalName }]` (Graph's
+   * `perUserMfaState`). A missing or failing readback endpoint leaves the
+   * envelope `verified:false` with a recheck instruction — never a false success.
+   *
+   * @param tenantFilter - Tenant domain or identifier.
+   * @param userId       - Azure AD object ID or UPN of the user.
+   * @param state        - Target per-user MFA state.
+   */
+  async setPerUserMFA<T = unknown>(
+    tenantFilter: string,
+    userId: string,
+    state: PerUserMfaState
+  ): Promise<T> {
+    if (!PER_USER_MFA_STATES.includes(state)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `state must be one of ${PER_USER_MFA_STATES.join(', ')} (got "${String(state)}").`
+      );
+    }
+
+    // Resolve both identifiers up front: CIPP needs the UPN in the body, and the
+    // object id keeps the readback independent of later UPN renames.
+    let upn = userId.includes('@') ? userId : undefined;
+    const id = await this.resolveUserObjectId(tenantFilter, userId);
+    if (!upn) {
+      const user = await this.readUserById<{ userPrincipalName?: string }>(tenantFilter, id);
+      upn = typeof user?.userPrincipalName === 'string' ? user.userPrincipalName : undefined;
+    }
+    if (!upn) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Could not resolve user "${userId}" to a UPN in tenant ${tenantFilter}. Refusing to call ExecPerUserMFA without one.`
+      );
+    }
+
+    const readState = async (): Promise<string | undefined> => {
+      const res = await this.request<unknown>('GET', 'ListPerUserMFA', {
+        tenantFilter,
+        userId: id,
+      });
+      const row = (Array.isArray(res) ? res[0] : res) as Record<string, unknown> | undefined;
+      const value = row?.PerUserMFAState ?? row?.perUserMfaState;
+      return typeof value === 'string' ? value.toLowerCase() : undefined;
+    };
+
+    return (await this.verifyWrite({
+      run: () =>
+        this.request('POST', 'ExecPerUserMFA', undefined, {
+          tenantFilter,
+          userId: id,
+          userPrincipalName: upn,
+          State: state,
+        }),
+      verifiedBy: 'perUserMfaState',
+      readback: async () => (await readState()) === state,
+      successMessage: `Per-user MFA for ${upn} in ${tenantFilter} set to "${state}" (perUserMfaState=${state} confirmed).`,
+      recheckMessage: `CIPP accepted ExecPerUserMFA for ${upn}, but perUserMfaState was not observed as "${state}" within the verification window. Re-check the user's per-user MFA state in CIPP before confirming.`,
+    })) as T;
+  }
+
+  /**
    * Offboard a user, optionally applying additional cleanup actions.
    * Calls the `ExecOffboardUser` Azure Function.
    *
@@ -997,6 +1106,89 @@ export class CippService {
       return typeof displayName === 'string' && displayName.toLowerCase().includes(needle);
     });
     return filtered as T;
+  }
+
+  /**
+   * List the members of a single group.
+   * Calls the `ListGroups` Azure Function with `groupID` + `members=true`.
+   *
+   * UNVERIFIED against upstream — confirm before deploy. With `members=true`
+   * CIPP is believed to return a single object
+   * `{ groupInfo, members: [...], owners: [...] }` rather than the group list;
+   * an older/bare `members` array is accepted too. There is no separate
+   * `ListGroupMembers` endpoint assumed here.
+   *
+   * Accepts either `groupId` (object id) or an exact `groupName`
+   * (case-insensitive display-name match, resolved via `ListGroups`). A name
+   * that matches zero or several groups is an error rather than a guess.
+   */
+  async listGroupMembers(
+    tenantFilter: string,
+    params: { groupId?: string; groupName?: string }
+  ): Promise<GroupMembersResult> {
+    let groupId = params.groupId?.trim();
+    let resolvedName: string | undefined;
+
+    if (!groupId) {
+      const name = params.groupName?.trim();
+      if (!name) {
+        throw new McpError(ErrorCode.InvalidParams, 'Either groupId or groupName is required.');
+      }
+      const groups = await this.listGroups<Array<{ id?: unknown; displayName?: unknown }>>(
+        tenantFilter
+      );
+      const matches = (Array.isArray(groups) ? groups : []).filter(
+        (g) => typeof g?.displayName === 'string' && g.displayName.toLowerCase() === name.toLowerCase()
+      );
+      if (matches.length === 0) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `No group named "${name}" in tenant ${tenantFilter}. Use cipp_list_groups with search to find it.`
+        );
+      }
+      if (matches.length > 1) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `${matches.length} groups are named "${name}" in tenant ${tenantFilter}; pass groupId instead (ids: ${matches
+            .map((m) => String(m.id))
+            .join(', ')}).`
+        );
+      }
+      groupId = String(matches[0].id);
+      resolvedName = String(matches[0].displayName);
+    }
+
+    const payload = await this.request<unknown>('GET', 'ListGroups', {
+      tenantFilter,
+      groupID: groupId,
+      members: true,
+    });
+
+    const envelope = (payload && !Array.isArray(payload) ? payload : {}) as {
+      groupInfo?: { displayName?: unknown } | Array<{ displayName?: unknown }>;
+      members?: unknown;
+    };
+    const rawMembers = Array.isArray(payload)
+      ? payload
+      : Array.isArray(envelope.members)
+        ? envelope.members
+        : [];
+    const info = Array.isArray(envelope.groupInfo) ? envelope.groupInfo[0] : envelope.groupInfo;
+    const groupName =
+      typeof info?.displayName === 'string' ? info.displayName : (resolvedName ?? null);
+
+    const members = (rawMembers as Array<Record<string, unknown>>).map((m) => ({
+      id: (m?.id as string | undefined) ?? null,
+      displayName: (m?.displayName as string | undefined) ?? null,
+      userPrincipalName: (m?.userPrincipalName as string | undefined) ?? null,
+      mail: (m?.mail as string | undefined) ?? null,
+      type:
+        typeof m?.['@odata.type'] === 'string'
+          ? (m['@odata.type'] as string).replace('#microsoft.graph.', '')
+          : null,
+    }));
+
+    return { tenantFilter, groupId, groupName, memberCount: members.length, members };
   }
 
   /**
@@ -1650,6 +1842,112 @@ export class CippService {
    */
   async listGDAPInvites<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'ListGDAPInvite');
+  }
+
+  /**
+   * Create a GDAP relationship invite. Calls the `ExecGDAPInvite` Azure
+   * Function with `Action: 'Create'`.
+   *
+   * UNVERIFIED against upstream — confirm before deploy. Assumed contract:
+   *   - body `{ Action: 'Create', roleMappings: [...], Reference? }`, where each
+   *     roleMappings item matches a `ListGDAPRoles` row
+   *     `{ roleDefinitionId, GroupId, GroupName, RoleName }`. CIPP builds the
+   *     relationship's unifiedRoles from `roleDefinitionId` and later maps the
+   *     stored GroupId/role pairs once the customer approves, so a mapping with
+   *     no GroupId would grant the role to nobody.
+   *   - HTTP 200 on success AND failure; success is signalled by a populated
+   *     `Invite` (`{ RowKey: <relationshipId>, InviteUrl, OnboardingUrl, ... }`)
+   *     next to `Message`. No Invite / no InviteUrl ⇒ not created.
+   *
+   * Callers may pass bare `{ roleDefinitionId }` items; each is enriched with
+   * the GroupId/GroupName/RoleName configured in CIPP's GDAP role mappings
+   * (`ListGDAPRoles`). A roleDefinitionId with no configured mapping is
+   * rejected before anything is created.
+   *
+   * Verified from the synchronous result (the invite URL CIPP returns once the
+   * relationship is locked for approval); there is no Microsoft-side readback
+   * until the customer accepts.
+   */
+  async execGDAPInvite(
+    roleMappings: GdapRoleMapping[],
+    reference?: string
+  ): Promise<GdapInviteResult> {
+    if (!Array.isArray(roleMappings) || roleMappings.length === 0) {
+      throw new McpError(ErrorCode.InvalidParams, 'roleMappings must contain at least one { roleDefinitionId }.');
+    }
+    const missingId = roleMappings.filter(
+      (m) => typeof m?.roleDefinitionId !== 'string' || m.roleDefinitionId.trim() === ''
+    );
+    if (missingId.length > 0) {
+      throw new McpError(ErrorCode.InvalidParams, 'Every roleMappings item needs a roleDefinitionId.');
+    }
+
+    // Fill in GroupId/GroupName/RoleName from CIPP's configured mappings.
+    let configured: GdapRoleMapping[] | undefined;
+    const enriched: GdapRoleMapping[] = [];
+    const unmapped: string[] = [];
+    for (const m of roleMappings) {
+      if (m.GroupId) {
+        enriched.push(m);
+        continue;
+      }
+      if (!configured) {
+        const rows = await this.listGDAPRoles<GdapRoleMapping[]>();
+        configured = Array.isArray(rows) ? rows : [];
+      }
+      const want = m.roleDefinitionId.toLowerCase();
+      const hit = configured.find((r) => r?.roleDefinitionId?.toLowerCase() === want);
+      if (hit?.GroupId) {
+        enriched.push({
+          roleDefinitionId: m.roleDefinitionId,
+          GroupId: hit.GroupId,
+          ...(hit.GroupName !== undefined ? { GroupName: hit.GroupName } : {}),
+          ...(hit.RoleName !== undefined ? { RoleName: hit.RoleName } : {}),
+        });
+      } else {
+        unmapped.push(m.roleDefinitionId);
+      }
+    }
+    if (unmapped.length > 0) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `No CIPP GDAP role mapping (security group) is configured for roleDefinitionId(s): ${unmapped.join(', ')}. Map them in CIPP's GDAP role mappings first (see cipp_list_gdap_roles), or pass GroupId explicitly. Refusing to create an invite whose roles would be assigned to no group.`
+      );
+    }
+
+    const body: Record<string, unknown> = { Action: 'Create', roleMappings: enriched };
+    if (reference !== undefined && reference !== '') body.Reference = reference;
+
+    const submission = await this.request<{
+      Message?: unknown;
+      Invite?: { RowKey?: unknown; InviteUrl?: unknown; OnboardingUrl?: unknown } | null;
+    }>('POST', 'ExecGDAPInvite', undefined, body);
+
+    const invite = submission?.Invite ?? undefined;
+    const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+    const inviteUrl = str(invite?.InviteUrl);
+    const onboardingUrl = str(invite?.OnboardingUrl);
+    const relationshipId = str(invite?.RowKey);
+    const cippMessage = str(submission?.Message);
+    const verified = inviteUrl !== null && relationshipId !== null;
+
+    const recheck = `CIPP did not return an invite URL for ExecGDAPInvite${cippMessage ? ` (CIPP said: "${cippMessage}")` : ''}. Check cipp_list_gdap_invites and the CIPP logs before telling anyone an invite exists.`;
+    this.logger.info('ExecGDAPInvite completed', { verified, relationshipId });
+
+    return {
+      status: verified ? 'verified' : 'unverified',
+      verified,
+      verifiedBy: 'ExecGDAPInvite result (relationship locked for approval, InviteUrl returned)',
+      recheck: verified ? null : { instruction: recheck },
+      message: verified
+        ? `GDAP invite created (relationship ${relationshipId}). A Global Admin of the customer tenant must open the InviteUrl to approve it.`
+        : `${recheck} Do NOT report success until confirmed.`,
+      inviteUrl,
+      onboardingUrl,
+      relationshipId,
+      roleMappings: enriched,
+      submission,
+    };
   }
 
   // -------------------------------------------------------------------------

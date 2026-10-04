@@ -316,6 +316,35 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_set_per_user_mfa',
+    description:
+      '⚠ HIGH-IMPACT. Sets a user\'s legacy per-user MFA state (disabled / enabled / ' +
+      'enforced) via CIPP Set-CIPPPerUserMFA. "disabled" removes the per-user MFA ' +
+      'requirement; "enforced" requires MFA on every sign-in and can block legacy-auth ' +
+      'clients. Reversible by setting the previous state. Returns a verification ' +
+      'envelope: report success only when verified is true. Confirm with the user before invoking.',
+    annotations: {
+      title: 'Set per-user MFA state (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        userId: USER_ID_PROP,
+        state: {
+          type: 'string',
+          enum: ['disabled', 'enabled', 'enforced'],
+          description: 'Target per-user MFA state.',
+        },
+      },
+      required: ['tenantFilter', 'userId', 'state'],
+    },
+  },
+  {
     name: 'cipp_offboard_user',
     description:
       '⚠ DESTRUCTIVE — IRREVERSIBLE. Completely offboards a user by disabling ' +
@@ -476,6 +505,39 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           type: 'boolean',
           description:
             'Optional CIPP flag to read from the reporting database cache for faster group listings.',
+        },
+      },
+      required: ['tenantFilter'],
+    },
+  },
+  {
+    name: 'cipp_list_group_members',
+    description:
+      'List the members of one group (id, displayName, userPrincipalName, mail, object type). ' +
+      'Pass groupId, or an exact groupName (case-insensitive) which is resolved via ListGroups; ' +
+      'an ambiguous name returns an error listing the candidate ids. Read-only. Useful for ' +
+      'checking coverage of security-product groups (e.g. which users are in the Avanan group).',
+    annotations: {
+      title: 'List group members',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: {
+          type: 'string',
+          description: 'Tenant domain name or ID. A single tenant is required (not allTenants).',
+        },
+        groupId: {
+          type: 'string',
+          description: 'Object id of the group. Takes precedence over groupName.',
+        },
+        groupName: {
+          type: 'string',
+          description: 'Exact display name of the group, used when groupId is not known.',
         },
       },
       required: ['tenantFilter'],
@@ -1052,6 +1114,53 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
 
+  {
+    name: 'cipp_exec_gdap_invite',
+    description:
+      '⚠ HIGH-IMPACT. Creates a new GDAP (Granular Delegated Admin Privileges) relationship ' +
+      'invite via CIPP ExecGDAPInvite (Action=Create) for a 730-day relationship carrying the ' +
+      'given Entra roles. Returns inviteUrl (send to a Global Admin of the customer tenant to ' +
+      'approve), onboardingUrl (CIPP onboarding wizard) and relationshipId. Each roleMappings ' +
+      'item needs a roleDefinitionId; the matching security group is filled in from CIPP\'s GDAP ' +
+      'role mappings (cipp_list_gdap_roles) and unmapped roles are rejected. This does NOT assign ' +
+      'roles to users (CIPP has no add-role endpoint). Report success only when verified is true. ' +
+      'Confirm the role list with the user before invoking.',
+    annotations: {
+      title: 'Create GDAP invite (high-impact)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        roleMappings: {
+          type: 'array',
+          minItems: 1,
+          description:
+            'Roles to request. Each item: { roleDefinitionId } (Entra role template id), ' +
+            'optionally with GroupId / GroupName / RoleName to override the CIPP mapping.',
+          items: {
+            type: 'object',
+            properties: {
+              roleDefinitionId: { type: 'string' },
+              GroupId: { type: 'string' },
+              GroupName: { type: 'string' },
+              RoleName: { type: 'string' },
+            },
+            required: ['roleDefinitionId'],
+          },
+        },
+        reference: {
+          type: 'string',
+          description: 'Optional free-text reference stored with the invite (e.g. customer name or ticket number).',
+        },
+      },
+      required: ['roleMappings'],
+    },
+  },
+
   // -------------------------------------------------------------------------
   // Scheduler tools
   // -------------------------------------------------------------------------
@@ -1445,6 +1554,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_reset_password',
     'cipp_reset_mfa',
     'cipp_revoke_sessions',
+    'cipp_set_per_user_mfa',
     'cipp_offboard_user',
     'cipp_bec_check',
     'cipp_bec_remediate',
@@ -1452,7 +1562,12 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_list_user_devices',
     'cipp_list_user_groups',
   ],
-  groups: ['cipp_list_groups', 'cipp_create_group', 'cipp_edit_group_members'],
+  groups: [
+    'cipp_list_groups',
+    'cipp_list_group_members',
+    'cipp_create_group',
+    'cipp_edit_group_members',
+  ],
   mailboxes: [
     'cipp_list_mailboxes',
     'cipp_list_mailbox_permissions',
@@ -1479,7 +1594,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
   ],
   licenses: ['cipp_list_licenses', 'cipp_list_csp_licenses'],
   alerts: ['cipp_list_audit_logs', 'cipp_list_signin_logs', 'cipp_list_alert_queue'],
-  gdap: ['cipp_list_gdap_roles', 'cipp_list_gdap_invites'],
+  gdap: ['cipp_list_gdap_roles', 'cipp_list_gdap_invites', 'cipp_exec_gdap_invite'],
   scheduler: ['cipp_list_scheduled_items', 'cipp_add_scheduled_item'],
   core: ['cipp_ping', 'cipp_get_version', 'cipp_list_logs'],
   mailflow: ['cipp_list_transport_rules', 'cipp_list_exchange_connectors'],

@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cipp_set_per_user_mfa` tool (HIGH-IMPACT) — sets a user's legacy per-user
+  MFA state (`disabled` / `enabled` / `enforced`) via CIPP `ExecPerUserMFA`
+  (Set-CIPPPerUserMFA). Sends both the object id and the UPN, then reads back
+  `perUserMfaState` via `ListPerUserMFA` and returns the standard verification
+  envelope (`verified:false` + recheck when the state isn't observed).
+- `cipp_list_group_members` tool — lists one group's members via `ListGroups`
+  with `groupID` + `members=true`, shaped to id / displayName /
+  userPrincipalName / mail / object type. Accepts `groupId` or an exact
+  `groupName` (ambiguous names are an error). Supports checking product
+  coverage groups (e.g. Avanan) from chat.
+- `cipp_exec_gdap_invite` tool (HIGH-IMPACT) — creates a GDAP relationship
+  invite via `ExecGDAPInvite` (`Action=Create`). Bare `{ roleDefinitionId }`
+  mappings are enriched with the security group from CIPP's GDAP role mappings
+  (`ListGDAPRoles`); unmapped roles are rejected before anything is created.
+  Returns `inviteUrl`, `onboardingUrl` and `relationshipId` at the top level,
+  and is `verified` only when CIPP returned an invite URL (CIPP answers HTTP 200
+  even when creation fails). No role-assignment wrapper is added; CIPP has no
+  add-role endpoint.
+- NOTE: the request/response shapes for `ExecPerUserMFA`, `ListPerUserMFA`,
+  `ListGroups?members=true` and `ExecGDAPInvite` are UNVERIFIED against
+  upstream CIPP-API in this repo; confirm them against a live CIPP before deploy.
 - `cipp_list_enterprise_apps` tool — list enterprise applications
   (service principals) in a tenant via the CIPP `ListGraphRequest`
   passthrough against the `/servicePrincipals` Graph endpoint. Returns

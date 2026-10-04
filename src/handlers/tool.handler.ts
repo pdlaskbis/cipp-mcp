@@ -3,7 +3,11 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import { CippService } from '../services/cipp.service.js';
+import {
+  CippService,
+  GdapRoleMapping,
+  PerUserMfaState,
+} from '../services/cipp.service.js';
 import { Logger } from '../utils/logger.js';
 import { TOOL_DEFINITIONS } from '../mcp/tool.definitions.js';
 
@@ -169,6 +173,16 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_set_per_user_mfa': {
+          const { tenantFilter, userId, state } = args as {
+            tenantFilter: string;
+            userId: string;
+            state: PerUserMfaState;
+          };
+          result = await this.cippService.setPerUserMFA(tenantFilter, userId, state);
+          break;
+        }
+
         case 'cipp_offboard_user': {
           const {
             tenantFilter,
@@ -256,6 +270,16 @@ export class CippToolHandler {
             useReportDB?: boolean;
           };
           result = await this.cippService.listGroups(tenantFilter, { search, useReportDB });
+          break;
+        }
+
+        case 'cipp_list_group_members': {
+          const { tenantFilter, groupId, groupName } = args as {
+            tenantFilter: string;
+            groupId?: string;
+            groupName?: string;
+          };
+          result = await this.cippService.listGroupMembers(tenantFilter, { groupId, groupName });
           break;
         }
 
@@ -522,6 +546,15 @@ export class CippToolHandler {
 
         case 'cipp_list_gdap_invites': {
           result = await this.cippService.listGDAPInvites();
+          break;
+        }
+
+        case 'cipp_exec_gdap_invite': {
+          const { roleMappings, reference } = args as {
+            roleMappings: GdapRoleMapping[];
+            reference?: string;
+          };
+          result = await this.cippService.execGDAPInvite(roleMappings, reference);
           break;
         }
 
