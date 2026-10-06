@@ -100,6 +100,20 @@ export interface DeleteUserEnvelope extends Omit<VerifiedWriteEnvelope, 'status'
  */
 export const DELETE_USER_DENYLIST_ENV = 'CIPP_DELETE_USER_DENYLIST';
 
+/** Envelope for {@link CippService.deleteGroup}; see {@link DeleteUserEnvelope}. */
+export interface DeleteGroupEnvelope extends Omit<VerifiedWriteEnvelope, 'status'> {
+  status: 'verified' | 'unverified' | 'failed';
+  groupId: string;
+  displayName: string;
+  groupType: string;
+}
+
+/**
+ * The only GroupType values CIPP's Remove-CIPPGroup acts on. Anything else
+ * returns HTTP 200 having deleted nothing.
+ */
+const CIPP_DELETABLE_GROUP_TYPES = ['Microsoft 365', 'Security', 'Distribution List', 'Mail-Enabled Security'];
+
 export type PerUserMfaState = 'disabled' | 'enabled' | 'enforced';
 const PER_USER_MFA_STATES: PerUserMfaState[] = ['disabled', 'enabled', 'enforced'];
 
@@ -690,7 +704,7 @@ export class CippService {
     }
 
     // ---- Guard 4: no directory roles --------------------------------------
-    const roles = await this.directoryRolesHeldBy(tenant, id, upn);
+    const roles = await this.directoryRolesHeldBy(tenant, id, upn, true);
     if (roles.length > 0) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -709,17 +723,9 @@ export class CippService {
         userPrincipalName: upn,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const http = /CIPP API returned HTTP (\d+) for \S+ \S+: ([\s\S]*)$/.exec(message);
-      if (http) {
+      const failure = this.cippHttpFailure(err);
+      if (failure) {
         // CIPP answered and refused: Remove-CIPPUser threw, nothing was deleted.
-        let results: unknown = http[2];
-        try {
-          results = (JSON.parse(http[2]) as { Results?: unknown }).Results ?? http[2];
-        } catch {
-          // non-JSON body; surface it as-is
-        }
-        const text = typeof results === 'string' ? results : JSON.stringify(results);
         return {
           status: 'failed',
           verified: false,
@@ -727,15 +733,15 @@ export class CippService {
           recheck: {
             instruction: `CIPP reported the delete of ${who} failed, so the user should still exist. Confirm with cipp_list_users before retrying.`,
           },
-          message: `Delete FAILED for ${who} in ${tenant} (HTTP ${http[1]}). CIPP said: ${text}`,
-          submission: { httpStatus: Number(http[1]), Results: results },
+          message: `Delete FAILED for ${who} in ${tenant} (HTTP ${failure.httpStatus}). CIPP said: ${failure.text}`,
+          submission: { httpStatus: failure.httpStatus, Results: failure.results },
           userId: id,
           userPrincipalName: upn,
         };
       }
       // No HTTP answer (network error / timeout): the delete may or may not have
       // landed. Fall through to the readback, which is the only honest judge.
-      submission = { error: message };
+      submission = { error: err instanceof Error ? err.message : String(err) };
     }
 
     // ---- Hard verify: confirm the user is GONE ------------------------------
@@ -756,19 +762,7 @@ export class CippService {
       return rows.length === 0;
     };
 
-    const timeoutMs = Math.min(poll.timeoutMs ?? 20_000, 20_000);
-    const intervalMs = poll.intervalMs ?? 4_000;
-    const deadline = Date.now() + timeoutMs;
-    let verified = false;
-    for (;;) {
-      try {
-        verified = await isGone();
-      } catch {
-        verified = false; // a failed READ is not proof either way
-      }
-      if (verified || Date.now() >= deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
+    const verified = await this.pollUntilGone(isGone, poll);
 
     const recheck = `CIPP was asked to delete ${who} in ${tenant}, but the user was not confirmed gone within the verification window. Re-read the user (cipp_list_users by object id) before confirming the delete.`;
     return {
@@ -808,28 +802,36 @@ export class CippService {
   }
 
   /**
-   * Names of the directory roles a user holds, directly or via a role-assignable
-   * group, from `ListRoles` (Graph roleManagement roleAssignments — live, not
-   * the cached MFA report). Throws when either read fails: the caller must be
-   * able to PROVE a user holds no role before deleting it.
+   * Names of the directory roles a principal holds, from `ListRoles` (Graph
+   * roleManagement roleAssignments — live, not the cached MFA report). For a
+   * user (`viaUserGroups`), roles held through a role-assignable group count
+   * too. Throws when any read fails: the caller must be able to PROVE the
+   * principal holds no role before deleting it.
    */
-  private async directoryRolesHeldBy(tenantFilter: string, id: string, upn: string): Promise<string[]> {
+  private async directoryRolesHeldBy(
+    tenantFilter: string,
+    id: string,
+    label: string,
+    viaUserGroups: boolean
+  ): Promise<string[]> {
     let roles: unknown;
-    let groups: unknown;
+    let groups: unknown = [];
     try {
       roles = await this.request<unknown>('GET', 'ListRoles', { tenantFilter });
-      groups = await this.request<unknown>('GET', 'ListUserGroups', { tenantFilter, userId: id });
+      if (viaUserGroups) {
+        groups = await this.request<unknown>('GET', 'ListUserGroups', { tenantFilter, userId: id });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new McpError(
         ErrorCode.InvalidParams,
-        `Refusing to delete ${upn} (${id}): could not confirm it holds no directory role (${message}). No delete was sent.`
+        `Refusing to delete ${label} (${id}): could not confirm it holds no directory role (${message}). No delete was sent.`
       );
     }
     if (!Array.isArray(roles) || !Array.isArray(groups)) {
       throw new McpError(
         ErrorCode.InvalidParams,
-        `Refusing to delete ${upn} (${id}): the directory-role read returned an unexpected shape. No delete was sent.`
+        `Refusing to delete ${label} (${id}): the directory-role read returned an unexpected shape. No delete was sent.`
       );
     }
     const principals = new Set<string>([id.toLowerCase()]);
@@ -844,6 +846,291 @@ export class CippService {
       }
     }
     return held;
+  }
+
+  /**
+   * Poll `isGone` until it returns true or the budget runs out. Capped at 20s so
+   * it never outlives the MCP gateway tool-call deadline. A check that throws
+   * is "not yet confirmed" — a failed READ is not proof either way.
+   */
+  private async pollUntilGone(
+    isGone: () => Promise<boolean>,
+    poll: { timeoutMs?: number; intervalMs?: number }
+  ): Promise<boolean> {
+    const timeoutMs = Math.min(poll.timeoutMs ?? 20_000, 20_000);
+    const intervalMs = poll.intervalMs ?? 4_000;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let gone = false;
+      try {
+        gone = await isGone();
+      } catch {
+        gone = false;
+      }
+      if (gone) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+
+  /**
+   * When `err` is an HTTP error from {@link request} (CIPP answered with a
+   * non-2xx), return its status and the `Results` from the body; otherwise null
+   * (network error / timeout — the call may or may not have landed).
+   */
+  private cippHttpFailure(
+    err: unknown
+  ): { httpStatus: number; results: unknown; text: string } | null {
+    const message = err instanceof Error ? err.message : String(err);
+    const http = /CIPP API returned HTTP (\d+) for \S+ \S+: ([\s\S]*)$/.exec(message);
+    if (!http) return null;
+    let results: unknown = http[2];
+    try {
+      results = (JSON.parse(http[2]) as { Results?: unknown }).Results ?? http[2];
+    } catch {
+      // non-JSON body; surface it as-is
+    }
+    const text = typeof results === 'string' ? results : JSON.stringify(results);
+    return { httpStatus: Number(http[1]), results, text };
+  }
+
+  /**
+   * Delete a group. Calls the `ExecGroupsDelete` Azure Function.
+   *
+   * Restorability depends on the type: a Microsoft 365 group is soft-deleted
+   * (restorable from Entra "Deleted groups" for 30 days, with its mailbox, site
+   * and Team). Security groups, mail-enabled security groups and distribution
+   * lists are NOT restorable — treat those deletes as permanent.
+   *
+   * CONTRACT (KelvinTegelaar/CIPP-API, Invoke-ExecGroupsDelete.ps1 +
+   * Remove-CIPPGroup.ps1): reads `tenantFilter`, `id`, `GroupType`, `displayName`
+   * from Query or Body. `GroupType` must be exactly one of 'Microsoft 365',
+   * 'Security', 'Distribution List', 'Mail-Enabled Security' — any other value
+   * falls through both branches and returns HTTP 200 with null Results having
+   * deleted NOTHING. So the type is read from the group itself (ListGroups'
+   * computed `groupType`) and never taken from the caller. M365/Security go
+   * through Graph DELETE (a licensed Security group has its licenses stripped
+   * first); DL/Mail-Enabled Security go through EXO Remove-DistributionGroup.
+   * Synchronous: 200 "Successfully Deleted …" or 500 "Could not delete …".
+   *
+   * Guards, all client-side and all before the CIPP call:
+   *   1. single tenant only (`allTenants` refused); the group must resolve
+   *      (object id, or a display name matching exactly one group).
+   *   2. its groupType must be one CIPP acts on (else CIPP silently no-ops).
+   *   3. on-prem synced groups are refused (delete them in AD; no override).
+   *   4. groups holding a directory role are refused (no override).
+   *   5. unless `force`: groups with members, with assigned licenses, or
+   *      backed by a Team are refused — the delete-an-empty-group order, and
+   *      deleting a populated group becomes a two-step mistake.
+   *
+   * Verification (hard-verify): after the 200, poll until the group is GONE —
+   * the by-id ListGroups read no longer returns it AND a ListGraphRequest
+   * `groups?$filter=id eq '…'` read returns no row. (By-id alone can't prove
+   * absence: ListGroups' batched read returns 200 with the Graph error body
+   * as `groupInfo`.) DL / Mail-Enabled Security deletes go through Exchange and
+   * can take longer than the 20s budget to leave the directory, so those often
+   * come back `recheck` rather than verified.
+   */
+  async deleteGroup(
+    tenantFilter: string,
+    groupId: string,
+    force = false,
+    poll: { timeoutMs?: number; intervalMs?: number } = {}
+  ): Promise<DeleteGroupEnvelope> {
+    const tenant = typeof tenantFilter === 'string' ? tenantFilter.trim() : '';
+    const input = typeof groupId === 'string' ? groupId.trim() : '';
+    if (!tenant) {
+      throw new McpError(ErrorCode.InvalidParams, 'tenantFilter is required for cipp_delete_group.');
+    }
+    if (tenant.toLowerCase() === 'alltenants') {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'cipp_delete_group is single-tenant only; tenantFilter "allTenants" is refused.'
+      );
+    }
+    if (!input) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'groupId is required for cipp_delete_group. No delete was sent.'
+      );
+    }
+
+    // ---- Guard 1: resolve to a live group ----------------------------------
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let id: string | undefined = GUID_RE.test(input) ? input : undefined;
+    if (!id) {
+      const groups = await this.listGroups<Array<{ id?: unknown; displayName?: unknown }>>(tenant);
+      const matches = (Array.isArray(groups) ? groups : []).filter(
+        (g) => typeof g?.displayName === 'string' && g.displayName.toLowerCase() === input.toLowerCase()
+      );
+      if (matches.length > 1) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `${matches.length} groups are named "${input}" in tenant ${tenant}; pass the object id instead (ids: ${matches
+            .map((m) => String(m.id))
+            .join(', ')}). No delete was sent.`
+        );
+      }
+      id = typeof matches[0]?.id === 'string' ? matches[0].id : undefined;
+    }
+
+    type GroupInfo = {
+      id?: unknown;
+      displayName?: unknown;
+      groupType?: unknown;
+      onPremisesSyncEnabled?: unknown;
+      assignedLicenses?: unknown;
+      teamsEnabled?: unknown;
+    };
+    const readGroup = async (gid: string): Promise<{ info?: GroupInfo; members: unknown[] }> => {
+      const payload = await this.request<unknown>('GET', 'ListGroups', {
+        tenantFilter: tenant,
+        groupID: gid,
+        members: true,
+      });
+      const env = (payload && !Array.isArray(payload) ? payload : {}) as {
+        groupInfo?: GroupInfo | GroupInfo[];
+        members?: unknown;
+      };
+      const info = Array.isArray(env.groupInfo) ? env.groupInfo[0] : env.groupInfo;
+      return { info, members: Array.isArray(env.members) ? env.members : [] };
+    };
+    const sameId = (v: unknown, gid: string) => typeof v === 'string' && v.toLowerCase() === gid.toLowerCase();
+
+    let group: { info?: GroupInfo; members: unknown[] } | undefined;
+    if (id) {
+      try {
+        group = await readGroup(id);
+      } catch {
+        group = undefined;
+      }
+    }
+    const name = typeof group?.info?.displayName === 'string' ? group.info.displayName : undefined;
+    if (!id || !group || !sameId(group.info?.id, id) || !name) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Group "${input}" was not found (or could not be read) in tenant ${tenant}. No delete was sent.`
+      );
+    }
+    id = String(group.info!.id);
+    const who = `group "${name}" (object id ${id})`;
+
+    // ---- Guard 2: a type CIPP actually acts on -----------------------------
+    const groupType = group.info?.groupType;
+    if (typeof groupType !== 'string' || !CIPP_DELETABLE_GROUP_TYPES.includes(groupType)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${who}: its group type (${JSON.stringify(groupType ?? null)}) is not one CIPP's ExecGroupsDelete handles, so CIPP would return success without deleting anything. Delete it in the portal. No delete was sent.`
+      );
+    }
+
+    // ---- Guard 3: on-prem synced -------------------------------------------
+    if (group.info?.onPremisesSyncEnabled === true) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${who}: it is synced from on-premises AD — delete it there, or the sync recreates it. No delete was sent.`
+      );
+    }
+
+    // ---- Guard 4: no directory roles ---------------------------------------
+    const roles = await this.directoryRolesHeldBy(tenant, id, `group "${name}"`, false);
+    if (roles.length > 0) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${who}: it holds directory role(s) ${roles.join(', ')}. Role-assignable group removal stays manual. No delete was sent.`
+      );
+    }
+
+    // ---- Guard 5: force-gated contents -------------------------------------
+    const licenses = Array.isArray(group.info?.assignedLicenses) ? group.info!.assignedLicenses : [];
+    const reasons: string[] = [];
+    if (group.members.length > 0) reasons.push(`it has ${group.members.length} member(s)`);
+    if (licenses.length > 0) {
+      reasons.push(`it assigns ${licenses.length} license(s) (CIPP strips them from every member first)`);
+    }
+    if (group.info?.teamsEnabled === true) reasons.push('it backs a Microsoft Team (the Team, site and mailbox go with it)');
+    if (reasons.length > 0 && !force) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${who}: ${reasons.join('; ')}. Empty it first, or pass force: true. No delete was sent.`
+      );
+    }
+
+    // ---- The delete ---------------------------------------------------------
+    const restorable = groupType === 'Microsoft 365';
+    const restore = restorable
+      ? `Restorable from Entra "Deleted groups" for 30 days by object id ${id}.`
+      : `A ${groupType} group is NOT restorable — this delete is permanent.`;
+    let submission: unknown;
+    try {
+      submission = await this.request('POST', 'ExecGroupsDelete', undefined, {
+        tenantFilter: tenant,
+        id,
+        GroupType: groupType,
+        displayName: name,
+      });
+    } catch (err) {
+      const failure = this.cippHttpFailure(err);
+      if (failure) {
+        return {
+          status: 'failed',
+          verified: false,
+          verifiedBy: 'groupNotFound',
+          recheck: {
+            instruction: `CIPP reported the delete of ${who} failed, so the group should still exist. Confirm with cipp_list_groups before retrying.`,
+          },
+          message: `Delete FAILED for ${who} in ${tenant} (HTTP ${failure.httpStatus}). CIPP said: ${failure.text}`,
+          submission: { httpStatus: failure.httpStatus, Results: failure.results },
+          groupId: id,
+          displayName: name,
+          groupType,
+        };
+      }
+      submission = { error: err instanceof Error ? err.message : String(err) };
+    }
+
+    // ---- Hard verify: confirm the group is GONE -----------------------------
+    const gid = id;
+    const isGone = async (): Promise<boolean> => {
+      let still: { info?: GroupInfo } | undefined;
+      try {
+        still = await readGroup(gid);
+      } catch {
+        still = undefined;
+      }
+      if (sameId(still?.info?.id, gid)) return false;
+      const res = await this.request<{ Results?: unknown }>('GET', 'ListGraphRequest', {
+        tenantFilter: tenant,
+        Endpoint: 'groups',
+        $filter: `id eq '${gid}'`,
+        $select: 'id',
+        SkipCache: true,
+        NoPagination: true,
+      });
+      // Anything but a clean empty array is inconclusive, never proof of absence.
+      const rows = res?.Results;
+      return Array.isArray(rows) && rows.length === 0;
+    };
+    const verified = await this.pollUntilGone(isGone, poll);
+
+    const lag =
+      groupType === 'Distribution List' || groupType === 'Mail-Enabled Security'
+        ? ' Exchange-side deletes can take a few minutes to leave the directory.'
+        : '';
+    const recheck = `CIPP was asked to delete ${who} in ${tenant}, but the group was not confirmed gone within the verification window.${lag} Re-read the group (cipp_list_groups) before confirming the delete.`;
+    return {
+      status: verified ? 'verified' : 'unverified',
+      verified,
+      verifiedBy: 'groupNotFound',
+      recheck: verified ? null : { instruction: recheck },
+      message: verified
+        ? `Deleted ${who} in ${tenant} (group confirmed not found). ${restore}`
+        : `${recheck} Do NOT report success until confirmed.`,
+      submission,
+      groupId: id,
+      displayName: name,
+      groupType,
+    };
   }
 
   /**

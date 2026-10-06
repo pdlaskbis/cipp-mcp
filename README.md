@@ -93,7 +93,7 @@ Add to your `claude_desktop_config.json`:
 |---|---|
 | Tenants | list_tenants, get_tenant_details |
 | Users | list_users, create_user, edit_user, disable_user, delete_user, reset_password, reset_mfa, revoke_sessions, set_per_user_mfa, offboard_user, bec_check, list_mfa_users, list_user_devices, list_user_groups |
-| Groups | list_groups, list_group_members, create_group, edit_group_members |
+| Groups | list_groups, list_group_members, create_group, edit_group_members, delete_group |
 | Mailboxes | list_mailboxes, list_mailbox_permissions, set_out_of_office, set_email_forwarding |
 | Security | list_conditional_access_policies, list_named_locations |
 | Standards | list_standards, run_standards_check, list_bpa, list_domain_health |

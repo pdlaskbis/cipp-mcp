@@ -147,6 +147,16 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_delete_group': {
+          const { tenantFilter, groupId, force } = args as {
+            tenantFilter: string;
+            groupId: string;
+            force?: boolean;
+          };
+          result = await this.cippService.deleteGroup(tenantFilter, groupId, force === true);
+          break;
+        }
+
         case 'cipp_delete_user': {
           const { tenantFilter, userId, force } = args as {
             tenantFilter: string;
