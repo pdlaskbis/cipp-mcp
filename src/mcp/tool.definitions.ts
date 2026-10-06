@@ -243,6 +243,42 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_delete_user',
+    description:
+      '⚠ DESTRUCTIVE. Deletes a user (and any mailbox attached, including shared ' +
+      'mailboxes). Soft-delete: restorable from Entra Deleted users for 30 days. ' +
+      'Confirm with the user before invoking. The account must already be disabled ' +
+      '(disable-then-delete) unless force is true. Refuses directory-role holders and ' +
+      'protected accounts. Returns the verification envelope: verified is true ONLY ' +
+      'once the user reads back as not found.',
+    annotations: {
+      title: 'Delete user (soft delete, 30-day restore)',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: {
+          type: 'string',
+          description:
+            "Tenant domain name or ID. Single tenant only — 'allTenants' is refused.",
+        },
+        userId: USER_ID_PROP,
+        force: {
+          type: 'boolean',
+          description:
+            'Delete even if the account is still enabled. Default false: an enabled ' +
+            'account is refused so the normal order (disable, then delete) is enforced.',
+          default: false,
+        },
+      },
+      required: ['tenantFilter', 'userId'],
+    },
+  },
+  {
     name: 'cipp_reset_password',
     description:
       '⚠ HIGH-IMPACT. Resets a user\'s password, invalidating their current ' +
@@ -1551,6 +1587,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_create_user',
     'cipp_edit_user',
     'cipp_disable_user',
+    'cipp_delete_user',
     'cipp_reset_password',
     'cipp_reset_mfa',
     'cipp_revoke_sessions',

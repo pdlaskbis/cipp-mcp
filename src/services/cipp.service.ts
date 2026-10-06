@@ -80,6 +80,26 @@ export interface VerifiedWriteEnvelope {
   submission: unknown;
 }
 
+/**
+ * Envelope for {@link CippService.deleteUser}. Same shape as
+ * {@link VerifiedWriteEnvelope} plus a `failed` status for the case where CIPP
+ * itself reported the delete failed (HTTP 500) — nothing was deleted.
+ */
+export interface DeleteUserEnvelope extends Omit<VerifiedWriteEnvelope, 'status'> {
+  status: 'verified' | 'unverified' | 'failed';
+  /** The resolved object id CIPP was asked to delete (restore by this id). */
+  userId: string;
+  /** The resolved UPN at the time of deletion. */
+  userPrincipalName: string;
+}
+
+/**
+ * Env var holding the comma-separated UPNs `cipp_delete_user` must never delete
+ * (e.g. the account that seeds CIPP's SAM app). Deployment-specific, so it is
+ * not hard-coded here. Unset or empty → every delete is refused (fail closed).
+ */
+export const DELETE_USER_DENYLIST_ENV = 'CIPP_DELETE_USER_DENYLIST';
+
 export type PerUserMfaState = 'disabled' | 'enabled' | 'enforced';
 const PER_USER_MFA_STATES: PerUserMfaState[] = ['disabled', 'enabled', 'enforced'];
 
@@ -559,6 +579,271 @@ export class CippService {
       successMessage: `Sign-in disabled for ${userId} in ${tenantFilter} (accountEnabled=false confirmed).`,
       recheckMessage: `CIPP accepted ExecDisableUser for ${userId}, but accountEnabled was not observed false within the verification window. Re-check the account (by object id) before confirming it is disabled.`,
     })) as T;
+  }
+
+  /**
+   * Delete a user (soft delete — restorable from Entra "Deleted users" for 30
+   * days). Deletes any attached mailbox with it, including shared mailboxes.
+   * Calls the `RemoveUser` Azure Function.
+   *
+   * CONTRACT (KelvinTegelaar/CIPP-API, Invoke-RemoveUser.ps1 + Remove-CIPPUser.ps1):
+   * reads `tenantFilter`, `ID`, `userPrincipalName` from Query or Body and runs
+   * Graph `DELETE /beta/users/{ID}` synchronously — 200 + "Successfully deleted
+   * user …" or 500 + "Failed to delete user … Error: …". A missing ID hits
+   * `if (!$UserID) { exit }` and returns NOTHING, so the ID is always resolved
+   * and validated here before the call.
+   *
+   * Guards, all client-side and all before the CIPP call:
+   *   1. single tenant only (`allTenants` refused); userId must resolve to a
+   *      live user via the by-id read, else no call is made.
+   *   2. the account must already be disabled (accountEnabled=false) unless
+   *      `force` — enforces disable-then-delete and makes deleting a live user
+   *      a two-step mistake. An unreadable accountEnabled counts as enabled.
+   *   3. hard denylist with no override: any UPN in
+   *      {@link DELETE_USER_DENYLIST_ENV}, and any UPN starting `breakglass`.
+   *      An unconfigured denylist refuses every delete.
+   *   4. refuses any user holding a directory role, directly or through a
+   *      role-assignable group (`ListRoles` assignments). Admin removal stays
+   *      manual. A roles read that fails refuses the delete.
+   * Guests (#EXT#) are allowed.
+   *
+   * Verification (hard-verify): after the 200, poll until the user is GONE —
+   * the by-id read no longer returns it AND a `graphFilter=id eq '…'` list
+   * read returns no row. The by-id read alone can't prove absence: Graph's 404
+   * escapes Invoke-ListUsers as an unhandled 500, indistinguishable from a
+   * transient read failure, while the filtered list returns a clean `[]`.
+   * Budget ≤20s to stay under the MCP gateway deadline.
+   */
+  async deleteUser(
+    tenantFilter: string,
+    userId: string,
+    force = false,
+    poll: { timeoutMs?: number; intervalMs?: number } = {}
+  ): Promise<DeleteUserEnvelope> {
+    const tenant = typeof tenantFilter === 'string' ? tenantFilter.trim() : '';
+    const input = typeof userId === 'string' ? userId.trim() : '';
+    if (!tenant) {
+      throw new McpError(ErrorCode.InvalidParams, 'tenantFilter is required for cipp_delete_user.');
+    }
+    if (tenant.toLowerCase() === 'alltenants') {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'cipp_delete_user is single-tenant only; tenantFilter "allTenants" is refused.'
+      );
+    }
+    if (!input) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        'userId is required for cipp_delete_user (CIPP RemoveUser silently returns nothing without an ID). No delete was sent.'
+      );
+    }
+
+    // Denylist is checked on the raw input too, so a denylisted UPN never even
+    // costs a lookup; it is re-checked on the resolved UPN below.
+    const denylisted = this.deleteDenylistReason(input);
+    if (denylisted) throw new McpError(ErrorCode.InvalidParams, denylisted);
+
+    // ---- Guard 1: resolve to a live user -----------------------------------
+    const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    let id: string | undefined = GUID_RE.test(input) ? input : undefined;
+    if (!id) {
+      const rows = await this.request<Array<Record<string, unknown>>>('GET', 'ListUsers', {
+        tenantFilter: tenant,
+        graphFilter: `userPrincipalName eq '${input.replace(/'/g, "''")}'`,
+      });
+      const match = (Array.isArray(rows) ? rows : []).find(
+        (u) =>
+          typeof u.userPrincipalName === 'string' &&
+          u.userPrincipalName.toLowerCase() === input.toLowerCase()
+      );
+      id = typeof match?.id === 'string' ? match.id : undefined;
+    }
+    let user: { id?: unknown; userPrincipalName?: unknown; accountEnabled?: unknown } | undefined;
+    if (id) {
+      try {
+        user = await this.readUserById(tenant, id);
+      } catch {
+        user = undefined;
+      }
+    }
+    const resolvedId = typeof user?.id === 'string' ? user.id : undefined;
+    const upn = typeof user?.userPrincipalName === 'string' ? user.userPrincipalName : undefined;
+    if (!id || !resolvedId || resolvedId.toLowerCase() !== id.toLowerCase() || !upn) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `User "${input}" was not found (or could not be read) in tenant ${tenant}. No delete was sent.`
+      );
+    }
+    id = resolvedId;
+
+    // ---- Guard 3 (resolved UPN) -------------------------------------------
+    const denylistedUpn = this.deleteDenylistReason(upn);
+    if (denylistedUpn) throw new McpError(ErrorCode.InvalidParams, denylistedUpn);
+
+    // ---- Guard 2: disable-then-delete -------------------------------------
+    if (user?.accountEnabled !== false && !force) {
+      const state = user?.accountEnabled === true ? 'enabled' : 'of unknown enabled state';
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${upn} (${id}): the account is ${state}. Disable it first (cipp_disable_user), or pass force: true to delete a live account. No delete was sent.`
+      );
+    }
+
+    // ---- Guard 4: no directory roles --------------------------------------
+    const roles = await this.directoryRolesHeldBy(tenant, id, upn);
+    if (roles.length > 0) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${upn} (${id}): it holds directory role(s) ${roles.join(', ')}. Admin removal stays manual. No delete was sent.`
+      );
+    }
+
+    // ---- The delete ---------------------------------------------------------
+    const who = `${upn} (object id ${id})`;
+    const restore = `Restorable from Entra "Deleted users" for 30 days by object id ${id}.`;
+    let submission: unknown;
+    try {
+      submission = await this.request('POST', 'RemoveUser', undefined, {
+        tenantFilter: tenant,
+        ID: id,
+        userPrincipalName: upn,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const http = /CIPP API returned HTTP (\d+) for \S+ \S+: ([\s\S]*)$/.exec(message);
+      if (http) {
+        // CIPP answered and refused: Remove-CIPPUser threw, nothing was deleted.
+        let results: unknown = http[2];
+        try {
+          results = (JSON.parse(http[2]) as { Results?: unknown }).Results ?? http[2];
+        } catch {
+          // non-JSON body; surface it as-is
+        }
+        const text = typeof results === 'string' ? results : JSON.stringify(results);
+        return {
+          status: 'failed',
+          verified: false,
+          verifiedBy: 'userNotFound',
+          recheck: {
+            instruction: `CIPP reported the delete of ${who} failed, so the user should still exist. Confirm with cipp_list_users before retrying.`,
+          },
+          message: `Delete FAILED for ${who} in ${tenant} (HTTP ${http[1]}). CIPP said: ${text}`,
+          submission: { httpStatus: Number(http[1]), Results: results },
+          userId: id,
+          userPrincipalName: upn,
+        };
+      }
+      // No HTTP answer (network error / timeout): the delete may or may not have
+      // landed. Fall through to the readback, which is the only honest judge.
+      submission = { error: message };
+    }
+
+    // ---- Hard verify: confirm the user is GONE ------------------------------
+    const isGone = async (): Promise<boolean> => {
+      let byId: Record<string, unknown> | undefined;
+      try {
+        byId = await this.readUserById(tenant, id!);
+      } catch {
+        byId = undefined;
+      }
+      if (typeof byId?.id === 'string' && byId.id.toLowerCase() === id!.toLowerCase()) return false;
+      const rows = await this.request<unknown>('GET', 'ListUsers', {
+        tenantFilter: tenant,
+        graphFilter: `id eq '${id}'`,
+      });
+      // Anything but a clean array is inconclusive, never proof of absence.
+      if (!Array.isArray(rows)) return false;
+      return rows.length === 0;
+    };
+
+    const timeoutMs = Math.min(poll.timeoutMs ?? 20_000, 20_000);
+    const intervalMs = poll.intervalMs ?? 4_000;
+    const deadline = Date.now() + timeoutMs;
+    let verified = false;
+    for (;;) {
+      try {
+        verified = await isGone();
+      } catch {
+        verified = false; // a failed READ is not proof either way
+      }
+      if (verified || Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+
+    const recheck = `CIPP was asked to delete ${who} in ${tenant}, but the user was not confirmed gone within the verification window. Re-read the user (cipp_list_users by object id) before confirming the delete.`;
+    return {
+      status: verified ? 'verified' : 'unverified',
+      verified,
+      verifiedBy: 'userNotFound',
+      recheck: verified ? null : { instruction: recheck },
+      message: verified
+        ? `Deleted ${who} in ${tenant} (user confirmed not found). ${restore}`
+        : `${recheck} Do NOT report success until confirmed.`,
+      submission,
+      userId: id,
+      userPrincipalName: upn,
+    };
+  }
+
+  /**
+   * Denylist check for {@link deleteUser}. Returns the refusal message, or null
+   * when the UPN may be deleted. No override exists by design.
+   */
+  private deleteDenylistReason(upnOrId: string): string | null {
+    const value = upnOrId.trim().toLowerCase();
+    if (value.startsWith('breakglass')) {
+      return `Refusing to delete "${upnOrId}": break-glass accounts are on the hard denylist (no override).`;
+    }
+    const configured = (process.env[DELETE_USER_DENYLIST_ENV] ?? '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    if (configured.length === 0) {
+      return `Refusing to delete: ${DELETE_USER_DENYLIST_ENV} is not configured, so protected accounts cannot be excluded. Set it on the server before using cipp_delete_user.`;
+    }
+    if (configured.includes(value)) {
+      return `Refusing to delete "${upnOrId}": the account is on the hard denylist (no override).`;
+    }
+    return null;
+  }
+
+  /**
+   * Names of the directory roles a user holds, directly or via a role-assignable
+   * group, from `ListRoles` (Graph roleManagement roleAssignments — live, not
+   * the cached MFA report). Throws when either read fails: the caller must be
+   * able to PROVE a user holds no role before deleting it.
+   */
+  private async directoryRolesHeldBy(tenantFilter: string, id: string, upn: string): Promise<string[]> {
+    let roles: unknown;
+    let groups: unknown;
+    try {
+      roles = await this.request<unknown>('GET', 'ListRoles', { tenantFilter });
+      groups = await this.request<unknown>('GET', 'ListUserGroups', { tenantFilter, userId: id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${upn} (${id}): could not confirm it holds no directory role (${message}). No delete was sent.`
+      );
+    }
+    if (!Array.isArray(roles) || !Array.isArray(groups)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Refusing to delete ${upn} (${id}): the directory-role read returned an unexpected shape. No delete was sent.`
+      );
+    }
+    const principals = new Set<string>([id.toLowerCase()]);
+    for (const g of groups as Array<Record<string, unknown>>) {
+      if (typeof g?.id === 'string') principals.add(g.id.toLowerCase());
+    }
+    const held: string[] = [];
+    for (const role of roles as Array<Record<string, unknown>>) {
+      const members = Array.isArray(role?.Members) ? (role.Members as Array<Record<string, unknown>>) : [];
+      if (members.some((m) => typeof m?.id === 'string' && principals.has(m.id.toLowerCase()))) {
+        held.push(String(role.DisplayName ?? role.Id ?? 'unknown role'));
+      }
+    }
+    return held;
   }
 
   /**
