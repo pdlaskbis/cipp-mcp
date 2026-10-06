@@ -580,6 +580,47 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_delete_group',
+    description:
+      '⚠ DESTRUCTIVE. Deletes a group. A Microsoft 365 group (with its mailbox, site and ' +
+      'any Team) is restorable from Entra Deleted groups for 30 days; Security, ' +
+      'Mail-Enabled Security and Distribution List deletes are PERMANENT. Confirm with ' +
+      'the user before invoking. Refuses a group with members, assigned licenses or a ' +
+      'Team unless force is true; always refuses on-prem synced and role-holding groups. ' +
+      'Returns the verification envelope: verified is true ONLY once the group reads back ' +
+      'as not found.',
+    annotations: {
+      title: 'Delete group',
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: {
+          type: 'string',
+          description:
+            "Tenant domain name or ID. Single tenant only — 'allTenants' is refused.",
+        },
+        groupId: {
+          type: 'string',
+          description:
+            'The group\'s object ID, or its display name if exactly one group has that name.',
+        },
+        force: {
+          type: 'boolean',
+          description:
+            'Delete even if the group has members, assigned licenses, or backs a Team. ' +
+            'Default false: such groups are refused.',
+          default: false,
+        },
+      },
+      required: ['tenantFilter', 'groupId'],
+    },
+  },
+  {
     name: 'cipp_create_group',
     description:
       '⚠ HIGH-IMPACT. Creates a new group in the tenant, which can be used for ' +
@@ -1604,6 +1645,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
     'cipp_list_group_members',
     'cipp_create_group',
     'cipp_edit_group_members',
+    'cipp_delete_group',
   ],
   mailboxes: [
     'cipp_list_mailboxes',
