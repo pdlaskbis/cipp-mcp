@@ -147,6 +147,16 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_delete_user': {
+          const { tenantFilter, userId, force } = args as {
+            tenantFilter: string;
+            userId: string;
+            force?: boolean;
+          };
+          result = await this.cippService.deleteUser(tenantFilter, userId, force === true);
+          break;
+        }
+
         case 'cipp_reset_password': {
           const { tenantFilter, userId, newPassword } = args as {
             tenantFilter: string;
