@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `cipp_raw_request` tool (READ-ONLY escape hatch) — calls any CIPP read
+  Azure Function (`GET`/`POST {CIPP}/api/<functionName>`) that has no dedicated
+  tool yet, returning the response verbatim. Safe by construction: only
+  Functions whose name starts with `List`, `Get` or `Read` are allowed, and the
+  name is constrained to a bare segment, so it can neither mutate a tenant nor
+  escape `/api/`. Mirrors the raw-request escape hatch the Autotask and
+  SonicWall connectors already expose. Added to confirm the live DKIM endpoint
+  shape before the typed DKIM tools are written.
 - `cipp_set_per_user_mfa` tool (HIGH-IMPACT) — sets a user's legacy per-user
   MFA state (`disabled` / `enabled` / `enforced`) via CIPP `ExecPerUserMFA`
   (Set-CIPPPerUserMFA). Sends both the object id and the UPN, then reads back
