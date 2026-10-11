@@ -729,6 +729,20 @@ export class CippToolHandler {
           break;
         }
 
+        // -----------------------------------------------------------------------
+        // Raw / diagnostics
+        // -----------------------------------------------------------------------
+        case 'cipp_raw_request': {
+          const { functionName, method, query, body } = args as {
+            functionName: string;
+            method?: 'GET' | 'POST';
+            query?: Record<string, unknown>;
+            body?: Record<string, unknown>;
+          };
+          result = await this.cippService.rawRequest({ functionName, method, query, body });
+          break;
+        }
+
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }

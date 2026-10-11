@@ -52,6 +52,17 @@ export type CippGroupType =
  */
 const DOMAIN_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 
+/**
+ * Prefixes CIPP uses for its READ Azure Functions. `cipp_raw_request` only
+ * calls Functions whose name starts with one of these, so the escape hatch
+ * cannot reach anything that mutates a tenant (Exec*, Add*, Set*, New*,
+ * Remove*, Delete*, Edit*, Enable*, Disable*, Push*, Start*, Remediate*).
+ */
+const CIPP_READ_FUNCTION_PREFIXES = ['list', 'get', 'read'] as const;
+
+/** A bare CIPP Function segment: letters and digits only, no path or query. */
+const CIPP_FUNCTION_NAME_RE = /^[A-Za-z][A-Za-z0-9]*$/;
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -2292,6 +2303,56 @@ export class CippService {
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Raw / diagnostics
+  // -------------------------------------------------------------------------
+
+  /**
+   * READ-ONLY escape hatch: call a CIPP read Azure Function directly.
+   *
+   * CIPP has hundreds of Functions and adds more each release; this connector
+   * only wraps the common ones in typed tools. `rawRequest` reaches a read
+   * endpoint that has no typed tool yet — to answer a one-off question, or to
+   * confirm an endpoint's exact response shape before a typed tool is written
+   * for it (the reason this was added: verifying the live DKIM endpoint).
+   *
+   * READ-ONLY BY CONSTRUCTION. The Function name must begin with List, Get or
+   * Read (see {@link CIPP_READ_FUNCTION_PREFIXES}); anything that could change
+   * a tenant is refused here and must go through a purpose-built, verified
+   * write tool. The name is constrained to a bare Function segment, so it can
+   * never reach another path or escape `/api/`. GET sends `query` as the
+   * query string; POST sends `body` as JSON (a few read endpoints, e.g.
+   * ListTenants, are POST by CIPP's own convention).
+   *
+   * @returns The CIPP response verbatim (parsed JSON, or undefined on 200 + empty body).
+   */
+  async rawRequest(args: {
+    functionName: string;
+    method?: 'GET' | 'POST';
+    query?: Record<string, unknown>;
+    body?: Record<string, unknown>;
+  }): Promise<unknown> {
+    const functionName = (args.functionName ?? '').trim();
+
+    if (!CIPP_FUNCTION_NAME_RE.test(functionName)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `functionName must be a bare CIPP Function name — letters and digits only, no slash, dot or query string (e.g. "ListDomains"). Got: ${JSON.stringify(args.functionName)}`
+      );
+    }
+
+    const isRead = CIPP_READ_FUNCTION_PREFIXES.some((p) => functionName.toLowerCase().startsWith(p));
+    if (!isRead) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `cipp_raw_request is READ-ONLY: it only calls CIPP read Functions, whose names start with List, Get or Read. "${functionName}" is refused. A mutating endpoint must go through a purpose-built write tool that verifies the change afterwards.`
+      );
+    }
+
+    const method: 'GET' | 'POST' = args.method === 'POST' ? 'POST' : 'GET';
+    return this.request<unknown>(method, functionName, args.query, args.body);
   }
 
   // -------------------------------------------------------------------------

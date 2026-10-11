@@ -101,7 +101,7 @@ Add to your `claude_desktop_config.json`:
 | Alerts | list_audit_logs, list_alert_queue |
 | GDAP | list_gdap_roles, list_gdap_invites, exec_gdap_invite |
 | Scheduler | list_scheduled_items, add_scheduled_item |
-| Core | ping, get_version, list_logs |
+| Core | ping, get_version, list_logs, raw_request |
 
 ## Authentication Setup
 

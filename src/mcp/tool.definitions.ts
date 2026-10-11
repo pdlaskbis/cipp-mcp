@@ -1612,6 +1612,58 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       required: ['tenantFilter'],
     },
   },
+
+  // -------------------------------------------------------------------------
+  // Raw / diagnostics
+  // -------------------------------------------------------------------------
+  {
+    name: 'cipp_raw_request',
+    description:
+      'READ-ONLY escape hatch to a CIPP endpoint that has no dedicated tool yet. ' +
+      'Calls GET or POST {CIPP}/api/<functionName> and returns the response ' +
+      'verbatim. SAFE BY CONSTRUCTION: only CIPP read Functions are allowed — the ' +
+      'name must start with List, Get or Read. Anything that could change a tenant ' +
+      '(Exec/Add/Set/New/Remove/Delete/Edit/Enable/Disable/Push/Start) is refused; ' +
+      'those must go through a purpose-built write tool. Use it to answer a one-off ' +
+      "question, or to confirm an endpoint's exact response shape before a typed " +
+      'tool is built for it. Pass query params for GET, or a JSON body for POST ' +
+      '(a few read endpoints such as ListTenants are POST). Prefer a dedicated tool ' +
+      'when one exists.',
+    annotations: {
+      title: 'CIPP raw read request',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        functionName: {
+          type: 'string',
+          description:
+            'The CIPP Azure Function to call — a bare name (letters and digits only), ' +
+            'e.g. "ListDomains" or "ListDomainHealth". Must start with List, Get or Read.',
+        },
+        method: {
+          type: 'string',
+          enum: ['GET', 'POST'],
+          description:
+            'HTTP method. Defaults to GET. Use POST only for a read endpoint that requires it (e.g. ListTenants).',
+        },
+        query: {
+          type: 'object',
+          description:
+            'Query-string parameters, used for a GET request (ignored for POST). e.g. { "tenantFilter": "contoso.com", "Action": "ReadDkimRecord", "Domain": "contoso.com" }.',
+        },
+        body: {
+          type: 'object',
+          description: 'JSON request body, used for a POST request (ignored for GET).',
+        },
+      },
+      required: ['functionName'],
+    },
+  },
 ];
 // ---------------------------------------------------------------------------
 // Tool Categories
@@ -1675,6 +1727,6 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
   alerts: ['cipp_list_audit_logs', 'cipp_list_signin_logs', 'cipp_list_alert_queue'],
   gdap: ['cipp_list_gdap_roles', 'cipp_list_gdap_invites', 'cipp_exec_gdap_invite'],
   scheduler: ['cipp_list_scheduled_items', 'cipp_add_scheduled_item'],
-  core: ['cipp_ping', 'cipp_get_version', 'cipp_list_logs'],
+  core: ['cipp_ping', 'cipp_get_version', 'cipp_list_logs', 'cipp_raw_request'],
   mailflow: ['cipp_list_transport_rules', 'cipp_list_exchange_connectors'],
 };
