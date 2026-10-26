@@ -232,22 +232,37 @@ export class CippToolHandler {
           const {
             tenantFilter,
             userId,
+            caseId,
             useCached,
             maxAttempts,
             intervalMs,
             knownAppIds,
             knownIPs,
+            sampleSize,
+            section,
+            offset,
+            limit,
           } = args as {
             tenantFilter: string;
             userId: string;
+            caseId?: string;
             useCached?: boolean;
             maxAttempts?: number;
             intervalMs?: number;
             knownAppIds?: string[];
             knownIPs?: string[];
+            sampleSize?: number;
+            section?: string;
+            offset?: number;
+            limit?: number;
           };
           result = await this.cippService.becCheck(tenantFilter, userId, {
+            ...(caseId !== undefined ? { caseId } : {}),
             ...(useCached !== undefined ? { useCached } : {}),
+            ...(sampleSize !== undefined ? { sampleSize } : {}),
+            ...(section !== undefined ? { section } : {}),
+            ...(offset !== undefined ? { offset } : {}),
+            ...(limit !== undefined ? { limit } : {}),
             ...(maxAttempts !== undefined ? { maxAttempts } : {}),
             ...(intervalMs !== undefined ? { intervalMs } : {}),
             ...(knownAppIds !== undefined || knownIPs !== undefined

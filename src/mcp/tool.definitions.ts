@@ -425,18 +425,18 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'cipp_bec_check',
     description:
-      'Runs a Business Email Compromise check on a user and returns the actual ' +
-      'findings, not a job handle. Read-only. CIPP executes the check as a ' +
-      'background orchestrator job; this tool starts it and then polls for the ' +
-      'result, so a single call can take up to ~90 seconds. If the job is still ' +
+      'Runs a Business Email Compromise investigation on a user and returns the ' +
+      'findings, not a job handle. Read-only. CIPP runs each investigation as a ' +
+      'case (id BEC-yyyyMMddHHmmss-xxxxxx) of about 15 steps that typically takes ' +
+      'several minutes; this tool starts a case and polls it. If the case is still ' +
       'running when the poll budget is spent, the tool returns status="pending" ' +
-      'with a recheck instruction — call it again with useCached=true to collect ' +
-      'the findings WITHOUT restarting the run. By default every call forces a ' +
-      'fresh check: a cached result from an earlier investigation must never be ' +
-      'mistaken for a live one. Report a user as clean ONLY when ' +
-      'status="complete". status="indeterminate" means CIPP returned an empty ' +
-      'result set it cannot distinguish from "never ran" — that is not an ' +
-      'all-clear and must be confirmed in the CIPP BEC view.',
+      'with the caseId — call again with that caseId to collect the findings ' +
+      'WITHOUT starting another run. By default every call starts a fresh case: an ' +
+      'earlier investigation must never be mistaken for a live one. Report a user ' +
+      'as clean ONLY when status="complete" and assessment.severity="info", and ' +
+      'mention incompleteChecks (collectors CIPP could not run). ' +
+      'status="indeterminate" or "failed" is never an all-clear. Lists in findings ' +
+      'are cut to sampleSize rows (counts in truncated); use section to page one list.',
     annotations: {
       title: 'BEC check — run and return findings',
       readOnlyHint: true,
@@ -449,23 +449,47 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
         userId: USER_ID_PROP,
+        caseId: {
+          type: 'string',
+          description:
+            'An existing case id (BEC-…) to read instead of starting a new run. This is how ' +
+            'you collect a case that came back status="pending".',
+        },
         useCached: {
           type: 'boolean',
           description:
-            'When true, return a previous run\u2019s cached findings instead of ' +
-            'forcing a fresh check. This is how you collect the result of a call ' +
-            'that came back status="pending" — it reads the stored row in place ' +
-            'and does not restart the job. Defaults to false.',
+            'When true and no caseId is given, read the user\u2019s latest case instead of ' +
+            'starting a new one (a new one is started only if the user has none). Defaults to false.',
         },
         maxAttempts: {
           type: 'number',
           description:
-            'Number of poll attempts after the job is started. Defaults to 9. ' +
+            'Number of polls. Defaults to 9. ' +
             'Raise only if the MCP client tool-call deadline allows it.',
         },
         intervalMs: {
           type: 'number',
-          description: 'Milliseconds between poll attempts. Defaults to 10000.',
+          description: 'Milliseconds between polls. Defaults to 10000.',
+        },
+        sampleSize: {
+          type: 'number',
+          description:
+            'Rows kept per findings list (default 3). NonInteractiveSignIns and ' +
+            'AttackerMailActivity always return 0 rows here; use section for those.',
+        },
+        section: {
+          type: 'string',
+          description:
+            'Return one findings key in full instead of the compact view, e.g. ' +
+            '"SuspectUserSignIns", "MailActivity", "NonInteractiveSignIns". Use with caseId.',
+        },
+        offset: {
+          type: 'number',
+          description: 'Row offset when paging a section. Defaults to 0.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Rows per page when paging a section. Defaults to 100, max 500.',
         },
         knownAppIds: {
           type: 'array',

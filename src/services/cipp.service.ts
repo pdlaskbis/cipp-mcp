@@ -1423,27 +1423,33 @@ export class CippService {
   }
 
   /**
-   * Run a Business Email Compromise (BEC) check for a user and return the
-   * actual findings, not a job handle.
+   * Run a Business Email Compromise (BEC) investigation for a user and return
+   * the actual findings, not a job handle.
    *
-   * CONTRACT (verified against KelvinTegelaar/CIPP-API tag 10.7.0,
-   * Invoke-ExecBECCheck.ps1 — there is NO separate result endpoint):
+   * CONTRACT (verified against KelvinTegelaar/CIPP-API master,
+   * Invoke-ExecBECCheck.ps1 — the case-based investigation):
    *
-   *   Invoke-ExecBECCheck reads `Query.userid ?? Query.GUID`, looks up the
-   *   `cachebec` table (PartitionKey 'bec', RowKey = the user's object id) and
-   *   branches:
-   *     1. Results empty AND Status -ne 'Waiting'  -> queue BECRunOrchestrator,
-   *        write a Status='Waiting' row, return { GUID = userid }
-   *     2. else if Query.GUID is NOT set           -> return { GUID = userid }
-   *     3. else if row missing or Status='Waiting' -> return { Waiting = true }
-   *     4. else                                    -> return the Results
+   *   Every run is a CASE with its own id (`BEC-yyyyMMddHHmmss-xxxxxx`), kept in
+   *   the BecReports table. One endpoint, three modes:
+   *     - POST { tenantFilter, userid, userName }  -> queue a new run, returns
+   *       { GUID: caseId, CaseId, Status: 'Waiting' }
+   *     - GET  ?tenantFilter&userid (no GUID)      -> the user's latest non-failed
+   *       run as { GUID, Status }, or { GUID: null, NoRuns: true }. Starts nothing.
+   *     - GET  ?tenantFilter&GUID=<caseId>         -> while queued/running
+   *       { Waiting: true, Progress }; on failure { Waiting: false, Error,
+   *       Progress }; an unknown case { Waiting: false, Error: 'BEC run <id> was
+   *       not found …' }; otherwise the Results with server-side Score,
+   *       per-collector Completeness and a Run block.
    *
-   *   Branch 4 is reachable ONLY when GUID is on the query string. The previous
-   *   implementation sent `userId` alone, so it hit branch 2 on every call and
-   *   could never return a finding no matter how many times it was called. The
-   *   bug was a missing query parameter, not a missing endpoint.
+   *   The previous implementation polled with GUID = the user's object id (the
+   *   old cachebec contract). On case-based CIPP that is always "not found", and
+   *   the not-found body was then rendered as status "complete". Polling now uses
+   *   the case id the start call returns, and an Error body is never a result.
    *
-   *   The "GUID" is not a job id — it is the user's object id echoed back.
+   * SIZE: a finished case is several MB (thousands of non-interactive sign-ins
+   * and mail-access rows). Returned whole, it overflows the caller's context, so
+   * every list is cut to `sampleSize` rows with its full length in `truncated`.
+   * `section` returns one list in full, paged with offset/limit.
    *
    * ALERTING: every return path carries an `alert` field that is either null or
    * a ready-to-render payload. This method NEVER sends anything itself. Emitting
@@ -1461,186 +1467,377 @@ export class CippService {
     userIdOrUpn: string,
     options?: {
       useCached?: boolean;
+      caseId?: string;
       maxAttempts?: number;
       intervalMs?: number;
       baseline?: { knownAppIds?: string[]; knownIPs?: string[] };
+      sampleSize?: number;
+      section?: string;
+      offset?: number;
+      limit?: number;
     }
   ): Promise<T> {
-    type BecEnvelope = { GUID?: string; Waiting?: boolean } & Record<string, unknown>;
+    type BecEnvelope = {
+      GUID?: string | null;
+      CaseId?: string | null;
+      Status?: string | null;
+      NoRuns?: boolean;
+      Waiting?: boolean;
+      Error?: string;
+      Progress?: unknown;
+    } & Record<string, unknown>;
 
     const maxAttempts = options?.maxAttempts ?? 9;
     const intervalMs = options?.intervalMs ?? 10_000;
 
-    // CIPP passes userName into the BECRun orchestrator batch alongside UserID.
-    // USER_ID_PROP already advertises "object id OR UPN", which the old code did
-    // not honour — it passed whatever it got straight through as the cache row
-    // key. Resolve both halves up front so the declared contract is real.
+    // CIPP stores the UPN on the run and every mailbox-scoped collector uses it,
+    // so resolve both halves up front rather than passing a UPN as the object id.
     const identity = await this.resolveUserIdentity(tenantFilter, userIdOrUpn);
+    const upn = identity.userPrincipalName;
 
-    // ---- Phase 1: kick off -------------------------------------------------
-    // overwrite=true forces a fresh orchestrator run even when a cached row
-    // exists. Opt out only when the caller explicitly wants the cached answer.
-    await this.request<BecEnvelope>('GET', 'ExecBECCheck', {
-      tenantFilter,
-      userId: identity.id,
-      userName: identity.userPrincipalName,
-      ...(options?.useCached === true ? {} : { overwrite: true }),
-    });
+    // ---- Phase 1: find or start the case -----------------------------------
+    let caseId = options?.caseId?.trim() || undefined;
+    let started = false;
+    let source: 'caseId' | 'latest' | 'started' = 'caseId';
 
-    // ---- Phase 2: poll on GUID --------------------------------------------
-    // Sending GUID is what makes branches 3/4 reachable. Do not add userId here.
+    if (!caseId && options?.useCached === true) {
+      // Read-only lookup of the latest run; starts nothing.
+      const latest = await this.request<BecEnvelope>('GET', 'ExecBECCheck', {
+        tenantFilter,
+        userid: identity.id,
+      });
+      caseId = latest?.GUID ?? latest?.CaseId ?? undefined;
+      source = 'latest';
+    }
+
+    if (!caseId) {
+      const kickoff = await this.request<BecEnvelope>('POST', 'ExecBECCheck', undefined, {
+        tenantFilter,
+        userid: identity.id,
+        userName: upn,
+      });
+      caseId = kickoff?.GUID ?? kickoff?.CaseId ?? undefined;
+      started = true;
+      source = 'started';
+      if (!caseId) {
+        return {
+          status: 'indeterminate',
+          verified: false,
+          userPrincipalName: upn,
+          caseId: null,
+          findings: null,
+          recheck: null,
+          alert: {
+            severity: 'warning',
+            kind: 'malfunction',
+            title: 'BEC investigation did not start',
+            facts: [
+              { name: 'Tenant', value: tenantFilter },
+              { name: 'User', value: upn },
+              { name: 'Symptom', value: 'ExecBECCheck POST returned no case id' },
+              { name: 'Where', value: 'CIPP ExecBECCheck' },
+            ],
+            nextStep: `Start the investigation from the CIPP BEC view for ${upn} in ${tenantFilter}.`,
+          },
+          message:
+            `CIPP accepted the BEC request for ${upn} but returned no case id, so there is nothing to poll. ` +
+            'No result has been established. Start it from the CIPP BEC view.',
+          kickoff,
+        } as T;
+      }
+    }
+
+    const recheckArgs = { tenantFilter, userId: upn, caseId };
+
+    // ---- Phase 2: poll the case --------------------------------------------
     let attempts = 0;
-    let requeues = 0;
     let last: BecEnvelope | undefined;
 
     while (attempts < maxAttempts) {
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      // A fresh run cannot be done yet; an existing case may already be.
+      if (started || attempts > 0) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      }
       attempts += 1;
 
       last = await this.request<BecEnvelope>('GET', 'ExecBECCheck', {
         tenantFilter,
-        GUID: identity.id,
+        GUID: caseId,
       });
+
+      if (typeof last === 'string') {
+        try {
+          last = JSON.parse(last) as BecEnvelope;
+        } catch {
+          // fall through: a non-JSON string is treated as a result below
+        }
+      }
 
       if (last?.Waiting === true) continue;
 
-      // A bare { GUID } on a GUID-bearing poll means branch 1 fired: the run
-      // finished with EMPTY Results, so CIPP treated it as never-run and
-      // re-queued it. That is indistinguishable at the API from "ran and found
-      // nothing", and it will loop. Never render it as an all-clear.
-      if (last && last.GUID !== undefined && last.Waiting === undefined) {
-        requeues += 1;
-        if (requeues >= 2) {
-          return {
-            status: 'indeterminate',
-            verified: false,
-            userPrincipalName: identity.userPrincipalName,
-            findings: null,
-            recheck: {
-              tool: 'cipp_bec_check',
-              args: { tenantFilter, userId: identity.userPrincipalName, useCached: true },
-            },
-            alert: {
-              severity: 'warning',
-              kind: 'malfunction',
-              title: 'BEC check returned an undeterminable result',
-              facts: [
-                { name: 'Tenant', value: tenantFilter },
-                { name: 'User', value: identity.userPrincipalName },
-                { name: 'Symptom', value: `CIPP re-queued the job ${requeues}x on an empty result set` },
-                { name: 'Where', value: 'CIPP ExecBECCheck / cachebec table / BECRunOrchestrator' },
-                { name: 'Risk', value: 'This is NOT an all-clear — the account status is unknown' },
-              ],
-              nextStep:
-                `Open the BEC view in CIPP for ${identity.userPrincipalName} in ${tenantFilter} and confirm by hand. ` +
-                'Do not close any related ticket on this result.',
-            },
-            message:
-              `BEC check for ${identity.userPrincipalName} completed with an empty result set and CIPP re-queued it (${requeues}x). ` +
-              'CIPP cannot distinguish "ran and found nothing" from "never ran" when Results is empty. ' +
-              'Do NOT report this as clean. Confirm in the CIPP BEC view before drawing any conclusion.',
-          } as T;
-        }
-        continue;
+      // An Error body is a failed or unknown run. Never a result, never clean.
+      if (last && typeof last.Error === 'string' && last.Error.length > 0) {
+        const notFound = /not found/i.test(last.Error);
+        return {
+          status: notFound ? 'indeterminate' : 'failed',
+          verified: false,
+          userPrincipalName: upn,
+          caseId,
+          findings: null,
+          error: last.Error,
+          progress: this.summariseBecProgress(last.Progress),
+          recheck: notFound ? null : { tool: 'cipp_bec_check', args: { tenantFilter, userId: upn } },
+          alert: {
+            severity: 'warning',
+            kind: 'malfunction',
+            title: notFound ? 'BEC case not found' : 'BEC investigation failed',
+            facts: [
+              { name: 'Tenant', value: tenantFilter },
+              { name: 'User', value: upn },
+              { name: 'Case', value: caseId },
+              { name: 'Error', value: last.Error },
+              { name: 'Risk', value: 'This is NOT an all-clear — the account status is unknown' },
+            ],
+            nextStep: notFound
+              ? 'Check the case id against cipp_bec_check without caseId (useCached=true finds the latest run).'
+              : `Re-run cipp_bec_check for ${upn}, or open the case in the CIPP BEC view to see which step failed.`,
+          },
+          message:
+            `BEC case ${caseId} for ${upn}: ${last.Error}. ` +
+            'Do NOT report this account as clean; no findings were produced.',
+        } as T;
       }
 
-      // Anything else is the Results payload. Table storage may hand it back as
-      // a JSON string rather than an object; normalise without inventing shape.
-      let findings: unknown = last;
-      if (typeof last === 'string') {
-        try {
-          findings = JSON.parse(last);
-        } catch {
-          findings = last;
-        }
-      }
-
-      // ExtractResult is CIPP's own completion signal and is far more reliable
-      // than inferring completion from whether Results is empty.
-      const resultObj = (findings ?? {}) as Record<string, unknown>;
-      const extractResult = String(resultObj.ExtractResult ?? '');
-      const extractedAt = String(resultObj.ExtractedAt ?? '');
-      const extractOk = /\bsuccess/i.test(extractResult);
-
-      const assessment = this.assessBecFindings(resultObj, options?.baseline);
-
-      return {
-        status: 'complete',
-        verified: extractOk,
-        verifiedBy: extractOk
-          ? `CIPP ExtractResult: ${extractResult} (extracted ${extractedAt})`
-          : `ExecBECCheck returned cachebec Results for ${identity.id}`,
-        userPrincipalName: identity.userPrincipalName,
-        assessment,
-        findings,
-        recheck: null,
-        alert:
-          assessment.severity === 'info'
-            ? null
-            : {
-                severity: assessment.severity,
-                kind: 'finding',
-                title:
-                  assessment.severity === 'critical'
-                    ? 'BEC check found compromise indicators'
-                    : 'BEC check found activity needing review',
-                facts: [
-                  { name: 'Tenant', value: tenantFilter },
-                  { name: 'User', value: identity.userPrincipalName },
-                  ...assessment.reasons
-                    .slice(0, 8)
-                    .map((r, i) => ({ name: `Indicator ${i + 1}`, value: r })),
-                  { name: 'Where', value: 'CIPP BEC view — Identity > Administration > Users' },
-                ],
-                nextStep:
-                  assessment.severity === 'critical'
-                    ? 'Review the indicators before acting. Containment is cipp_bec_remediate, which locks the ' +
-                      'user out immediately — raise the Autotask Security Incident ticket and preserve evidence ' +
-                      'first where time allows.'
-                    : 'Triage against what is expected for this tenant. Pass knownAppIds / knownIPs on the next ' +
-                      'call to suppress anything confirmed legitimate.',
-              },
-        message: extractOk
-          ? `BEC check complete for ${identity.userPrincipalName} in ${tenantFilter} (severity: ${assessment.severity}). Findings below are CIPP's, unmodified.`
-          : `BEC check returned data for ${identity.userPrincipalName} but CIPP did not report a successful extract ` +
-            `(ExtractResult: "${extractResult}"). Treat the findings as INCOMPLETE — do not report an all-clear.`,
-      } as T;
+      return this.becCompleteEnvelope(tenantFilter, upn, caseId, last, {
+        started,
+        source,
+        baseline: options?.baseline,
+        sampleSize: options?.sampleSize,
+        section: options?.section,
+        offset: options?.offset,
+        limit: options?.limit,
+      }) as T;
     }
 
     // ---- Timed out, but NOT a dead end -------------------------------------
-    // The job is still running server-side. Because kickoff and fetch are the
-    // same endpoint, the caller re-fetches by calling this tool again with
-    // useCached=true — which skips overwrite and reads the row in place.
+    // The case keeps running server-side. Re-calling with caseId polls that
+    // same case without starting another.
     const elapsed = Math.round((attempts * intervalMs) / 1000);
     return {
       status: 'pending',
       verified: false,
-      userPrincipalName: identity.userPrincipalName,
+      userPrincipalName: upn,
+      caseId,
       findings: null,
+      progress: this.summariseBecProgress(last?.Progress),
       recheck: {
         tool: 'cipp_bec_check',
-        args: { tenantFilter, userId: identity.userPrincipalName, useCached: true },
-        notBefore: `${elapsed}s from now`,
+        args: recheckArgs,
+        notBefore: '60s from now',
       },
       alert: {
         severity: 'info',
         kind: 'malfunction',
-        title: 'BEC check did not finish inside the poll budget',
+        title: 'BEC investigation did not finish inside the poll budget',
         facts: [
           { name: 'Tenant', value: tenantFilter },
-          { name: 'User', value: identity.userPrincipalName },
+          { name: 'User', value: upn },
+          { name: 'Case', value: caseId },
           { name: 'Elapsed', value: `${elapsed}s across ${attempts} polls` },
-          { name: 'Where', value: 'CIPP BECRunOrchestrator — still executing, not cancelled' },
+          { name: 'Where', value: 'CIPP BECRun orchestrator — still executing, not cancelled' },
         ],
         nextStep:
-          `Call cipp_bec_check again for ${identity.userPrincipalName} with useCached=true to collect the ` +
-          'findings without restarting the run. No result has been established yet.',
+          `Call cipp_bec_check again with caseId=${caseId} to collect the findings without starting ` +
+          'another run. A full investigation typically takes several minutes.',
       },
       message:
-        `BEC check for ${identity.userPrincipalName} is still running after ${attempts} polls (~${elapsed}s). ` +
-        'The job was NOT cancelled — it is still executing in CIPP. Do NOT report a result. Call ' +
-        'cipp_bec_check again with useCached=true to collect the findings without restarting the run.',
+        `BEC case ${caseId} for ${upn} is still running after ${attempts} polls (~${elapsed}s). ` +
+        `It was NOT cancelled. Do NOT report a result. Call cipp_bec_check again with caseId=${caseId} ` +
+        'to collect the findings without starting another run.',
     } as T;
+  }
+
+  /** Large BEC lists whose rows are returned only on request via `section`. */
+  private static readonly BEC_BULK_SECTIONS = new Set([
+    'NonInteractiveSignIns',
+    'AttackerMailActivity',
+  ]);
+
+  /**
+   * Build the `complete` envelope for a finished BEC case: assessment, CIPP's
+   * own score, collectors that could not run, and size-bounded findings.
+   */
+  private becCompleteEnvelope(
+    tenantFilter: string,
+    upn: string,
+    caseId: string,
+    payload: unknown,
+    opts: {
+      started: boolean;
+      source: string;
+      baseline?: { knownAppIds?: string[]; knownIPs?: string[] };
+      sampleSize?: number;
+      section?: string;
+      offset?: number;
+      limit?: number;
+    }
+  ): Record<string, unknown> {
+    const resultObj = { ...((payload ?? {}) as Record<string, unknown>) };
+
+    // The evidence export embeds the whole zip as base64. Never hand that back.
+    const evidence = resultObj.Evidence as Record<string, unknown> | undefined;
+    if (evidence && typeof evidence === 'object' && 'ZipBase64' in evidence) {
+      const { ZipBase64: _zip, ...rest } = evidence;
+      resultObj.Evidence = { ...rest, ZipBase64: '<omitted>' };
+    }
+
+    const run = (resultObj.Run ?? {}) as Record<string, unknown>;
+    const extractResult = String(resultObj.ExtractResult ?? '');
+    const extractedAt = String(resultObj.ExtractedAt ?? run.ExtractedAt ?? '');
+    const runCompleted = String(run.Status ?? '') === 'Completed';
+    const extractOk = runCompleted || /\bsuccess/i.test(extractResult);
+
+    const assessment = this.assessBecFindings(resultObj, opts.baseline);
+
+    // Collectors CIPP could not run (licence, permission, service). Not an
+    // all-clear for whatever they cover.
+    const gaps: string[] = [];
+    const completeness = resultObj.Completeness;
+    if (completeness && typeof completeness === 'object') {
+      for (const [check, raw] of Object.entries(completeness as Record<string, unknown>)) {
+        const c = (raw ?? {}) as Record<string, unknown>;
+        if (c.Skipped === true || c.Complete === false || (c.Error !== null && c.Error !== undefined)) {
+          const why = c.Requirement ?? c.Error ?? (c.Cap !== null && c.Cap !== undefined ? `capped at ${c.Cap}` : 'incomplete');
+          gaps.push(`${check}: ${typeof why === 'string' ? why : JSON.stringify(why)}`);
+        }
+      }
+    }
+
+    // ---- size-bounded findings ----------------------------------------------
+    let findings: unknown;
+    let truncated: Record<string, number> | undefined;
+    let page: Record<string, unknown> | undefined;
+    if (opts.section) {
+      const v = resultObj[opts.section];
+      if (v === undefined) {
+        page = {
+          section: opts.section,
+          error: `No section "${opts.section}" in this case.`,
+          available: Object.keys(resultObj),
+        };
+      } else if (Array.isArray(v)) {
+        const offset = Math.max(0, opts.offset ?? 0);
+        const limit = Math.max(1, Math.min(opts.limit ?? 100, 500));
+        page = {
+          section: opts.section,
+          total: v.length,
+          offset,
+          limit,
+          nextOffset: offset + limit < v.length ? offset + limit : null,
+          rows: v.slice(offset, offset + limit),
+        };
+      } else {
+        page = { section: opts.section, value: v };
+      }
+      findings = null;
+    } else {
+      const n = Math.max(0, opts.sampleSize ?? 3);
+      truncated = {};
+      const compact: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(resultObj)) {
+        if (Array.isArray(v)) {
+          const keep = CippService.BEC_BULK_SECTIONS.has(k) ? 0 : n;
+          if (v.length > keep) truncated[k] = v.length;
+          compact[k] = v.slice(0, keep);
+        } else {
+          compact[k] = v;
+        }
+      }
+      findings = compact;
+    }
+
+    const score = resultObj.Score as { Value?: unknown; Level?: unknown } | undefined;
+    const scoreText =
+      score && score.Level !== undefined ? `CIPP score ${String(score.Value)} (${String(score.Level)})` : null;
+
+    return {
+      status: 'complete',
+      verified: extractOk,
+      verifiedBy: extractOk
+        ? runCompleted
+          ? `CIPP case ${caseId} Status=Completed (extracted ${extractedAt})`
+          : `CIPP ExtractResult: ${extractResult} (extracted ${extractedAt})`
+        : `ExecBECCheck returned results for case ${caseId} without a completed status`,
+      userPrincipalName: upn,
+      caseId,
+      startedNewRun: opts.started,
+      caseSource: opts.source,
+      assessment,
+      incompleteChecks: gaps,
+      findings,
+      ...(truncated && Object.keys(truncated).length > 0
+        ? {
+            truncated,
+            truncatedNote:
+              'Lists are cut to sampleSize rows (bulk lists to 0). Call again with caseId and section=<key> ' +
+              '(offset/limit) to page through one list.',
+          }
+        : {}),
+      ...(page ? { page } : {}),
+      recheck: null,
+      alert:
+        assessment.severity === 'info'
+          ? null
+          : {
+              severity: assessment.severity,
+              kind: 'finding',
+              title:
+                assessment.severity === 'critical'
+                  ? 'BEC check found compromise indicators'
+                  : 'BEC check found activity needing review',
+              facts: [
+                { name: 'Tenant', value: tenantFilter },
+                { name: 'User', value: upn },
+                { name: 'Case', value: caseId },
+                ...assessment.reasons
+                  .slice(0, 8)
+                  .map((r, i) => ({ name: `Indicator ${i + 1}`, value: r })),
+                { name: 'Where', value: 'CIPP BEC view — Identity > Administration > Users' },
+              ],
+              nextStep:
+                assessment.severity === 'critical'
+                  ? 'Review the indicators before acting. Containment is cipp_bec_remediate, which locks the ' +
+                    'user out immediately — raise the Autotask Security Incident ticket and preserve evidence ' +
+                    'first where time allows.'
+                  : 'Triage against what is expected for this tenant. Pass knownAppIds / knownIPs on the next ' +
+                    'call to suppress anything confirmed legitimate.',
+            },
+      message: extractOk
+        ? `BEC case ${caseId} complete for ${upn} in ${tenantFilter} (severity: ${assessment.severity}` +
+          `${scoreText ? `; ${scoreText}` : ''}).` +
+          (gaps.length > 0 ? ` ${gaps.length} check(s) could not run; see incompleteChecks.` : '') +
+          " Findings are CIPP's, unmodified apart from list truncation."
+        : `BEC case ${caseId} returned data for ${upn} but CIPP did not report a completed run ` +
+          `(ExtractResult: "${extractResult}"). Treat the findings as INCOMPLETE — do not report an all-clear.`,
+    };
+  }
+
+  /** Reduce CIPP's per-step progress block to "done/total, current step". */
+  private summariseBecProgress(progress: unknown): Record<string, unknown> | null {
+    if (!progress || typeof progress !== 'object') return null;
+    const p = progress as Record<string, unknown>;
+    const steps = Array.isArray(p.Steps) ? (p.Steps as Array<Record<string, unknown>>) : [];
+    if (steps.length === 0) return { status: p.Status ?? null };
+    const done = steps.filter((s) => /succeeded|completed|skipped/i.test(String(s.Status ?? s.State ?? ''))).length;
+    const current = steps.find((s) => /running/i.test(String(s.Status ?? s.State ?? '')));
+    const failed = steps.filter((s) => /fail|error/i.test(String(s.Status ?? s.State ?? '')));
+    return {
+      status: p.Status ?? null,
+      stepsDone: done,
+      stepsTotal: steps.length,
+      currentStep: current ? (current.Title ?? current.Name ?? null) : null,
+      failedSteps: failed.map((s) => s.Title ?? s.Name ?? null),
+    };
   }
 
   /**
@@ -3110,6 +3307,12 @@ export class CippService {
     for (const a of arr('AddedApps')) {
       const appId = String(a.appId ?? '').toLowerCase();
       if (appId && knownApps.has(appId)) continue;
+      // Case-based CIPP matches new apps against a known-malicious feed.
+      if (a.MaliciousMatch !== null && a.MaliciousMatch !== undefined && a.MaliciousMatch !== false) {
+        critical = true;
+        reasons.push(`New application "${String(a.displayName ?? a.appDisplayName ?? appId)}" matches CIPP's malicious-app feed`);
+        continue;
+      }
       warning = true;
       reasons.push(
         `New application "${String(a.displayName ?? a.appDisplayName ?? appId)}" registered ${String(a.createdDateTime ?? '')}`.trim()
@@ -3117,12 +3320,38 @@ export class CippService {
     }
 
     // SUCCESSFUL logons from unrecognised IPs. Failed logons are spray noise
-    // and are deliberately ignored.
+    // and are deliberately ignored. Case-based CIPP returns SuspectUserSignIns
+    // with its own per-IP verdict (Safe, LikelyUser, Service, Unknown,
+    // Suspicious, LikelyAttacker, Compromised); the old cachebec shape was
+    // SuspectUserMailboxLogons with no verdict.
+    const signIns = [...arr('SuspectUserSignIns'), ...arr('SuspectUserMailboxLogons')];
     const successIPs = new Set<string>();
-    for (const l of arr('SuspectUserMailboxLogons')) {
+    const attackerIPs = new Set<string>();
+    const suspiciousIPs = new Set<string>();
+    for (const l of signIns) {
       if (String(l.Status ?? '') !== 'Success') continue;
       const ip = String(l.IPAddress ?? '');
-      if (ip && !knownIPs.has(ip)) successIPs.add(ip);
+      if (!ip || knownIPs.has(ip)) continue;
+      const verdict = l.IPVerdict === undefined || l.IPVerdict === null ? null : String(l.IPVerdict);
+      if (verdict === null) {
+        successIPs.add(ip);
+      } else if (/^(Compromised|LikelyAttacker)$/i.test(verdict)) {
+        attackerIPs.add(ip);
+      } else if (/^Suspicious$/i.test(verdict) || l.ForeignLocation === true) {
+        suspiciousIPs.add(ip);
+      }
+    }
+    if (attackerIPs.size > 0) {
+      critical = true;
+      reasons.push(
+        `Successful sign-ins from ${attackerIPs.size} IP(s) CIPP rates as attacker: ${[...attackerIPs].join(', ')}`
+      );
+    }
+    if (suspiciousIPs.size > 0) {
+      warning = true;
+      reasons.push(
+        `Successful sign-ins from ${suspiciousIPs.size} suspicious or foreign IP(s): ${[...suspiciousIPs].join(', ')}`
+      );
     }
     if (successIPs.size > 0) {
       warning = true;
@@ -3131,13 +3360,33 @@ export class CippService {
       );
     }
 
+    // CIPP's own server-side score. High is CIPP saying compromise; Medium is
+    // CIPP saying review. Low never lowers what the checks above found.
+    const score = findings?.Score as
+      | { Value?: unknown; Level?: unknown; Breakdown?: Array<Record<string, unknown>> }
+      | undefined;
+    if (score && typeof score === 'object' && score.Level !== undefined) {
+      const level = String(score.Level);
+      const applied = (Array.isArray(score.Breakdown) ? score.Breakdown : [])
+        .filter((b) => b.Applied === true)
+        .map((b) => `${String(b.Signal ?? '?')} (${String(b.Count ?? '')})`);
+      if (/^high$/i.test(level)) critical = true;
+      else if (/^medium$/i.test(level)) warning = true;
+      if (!/^low$/i.test(level)) {
+        reasons.push(
+          `CIPP threat level ${level} (score ${String(score.Value)})` +
+            (applied.length > 0 ? `: ${applied.join(', ')}` : '')
+        );
+      }
+    }
+
     const counts: Record<string, number> = {
       newRules: rules.length,
       addedApps: arr('AddedApps').length,
       permissionChanges: arr('MailboxPermissionChanges').length,
       newUsers: arr('NewUsers').length,
       changedPasswords: arr('ChangedPasswords').length,
-      logonRecords: arr('SuspectUserMailboxLogons').length,
+      logonRecords: signIns.length,
     };
 
     return {
