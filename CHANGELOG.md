@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `cipp_exec_gdap_invite` now returns the invite link on `admin.cloud.microsoft`.
+  CIPP hands back `admin.microsoft.com`, which redirects and drops the `#`
+  fragment, so the link opened "The GDAP invitation was not found" (proven
+  2026-07-28). The success message also says how approval really works
+  (customer admin center > Settings > Partner relationships) and that the CIPP
+  onboarding must run afterwards to assign our groups.
+
 ### Added
 - `cipp_raw_request` tool (READ-ONLY escape hatch) — calls any CIPP read
   Azure Function (`GET`/`POST {CIPP}/api/<functionName>`) that has no dedicated

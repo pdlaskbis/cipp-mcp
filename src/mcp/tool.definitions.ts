@@ -1220,8 +1220,11 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     description:
       '⚠ HIGH-IMPACT. Creates a new GDAP (Granular Delegated Admin Privileges) relationship ' +
       'invite via CIPP ExecGDAPInvite (Action=Create) for a 730-day relationship carrying the ' +
-      'given Entra roles. Returns inviteUrl (send to a Global Admin of the customer tenant to ' +
-      'approve), onboardingUrl (CIPP onboarding wizard) and relationshipId. Each roleMappings ' +
+      'given Entra roles. Returns inviteUrl (host rewritten to admin.cloud.microsoft; a Global ' +
+      'Admin of the customer tenant approves it, best via that tenant\'s admin center > Settings > ' +
+      'Partner relationships), onboardingUrl (CIPP onboarding wizard: run it after approval, it ' +
+      'assigns our security groups; without it the relationship grants nobody access) and ' +
+      'relationshipId. Each roleMappings ' +
       'item needs a roleDefinitionId; the matching security group is filled in from CIPP\'s GDAP ' +
       'role mappings (cipp_list_gdap_roles) and unmapped roles are rejected. This does NOT assign ' +
       'roles to users (CIPP has no add-role endpoint). Report success only when verified is true. ' +

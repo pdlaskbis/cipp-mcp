@@ -2755,7 +2755,13 @@ export class CippService {
 
     const invite = submission?.Invite ?? undefined;
     const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
-    const inviteUrl = str(invite?.InviteUrl);
+    // CIPP returns admin.microsoft.com links. That host redirects and drops the
+    // #fragment, so the page says "The GDAP invitation was not found" (proven
+    // 2026-07-28). admin.cloud.microsoft with the same path works.
+    const rawInviteUrl = str(invite?.InviteUrl);
+    const inviteUrl = rawInviteUrl === null
+      ? null
+      : rawInviteUrl.replace(/^https:\/\/admin\.microsoft\.com\//i, 'https://admin.cloud.microsoft/');
     const onboardingUrl = str(invite?.OnboardingUrl);
     const relationshipId = str(invite?.RowKey);
     const cippMessage = str(submission?.Message);
@@ -2770,7 +2776,11 @@ export class CippService {
       verifiedBy: 'ExecGDAPInvite result (relationship locked for approval, InviteUrl returned)',
       recheck: verified ? null : { instruction: recheck },
       message: verified
-        ? `GDAP invite created (relationship ${relationshipId}). A Global Admin of the customer tenant must open the InviteUrl to approve it.`
+        ? `GDAP invite created (relationship ${relationshipId}). Approve it from inside the customer tenant: ` +
+          'private window, https://admin.cloud.microsoft, sign in as a Global Admin of THAT tenant, ' +
+          'Settings > Partner relationships, approve the pending request (the inviteUrl is the fallback). ' +
+          'Then run the CIPP onboarding (onboardingUrl) so our security groups are assigned; until then ' +
+          'the relationship grants nobody access.'
         : `${recheck} Do NOT report success until confirmed.`,
       inviteUrl,
       onboardingUrl,

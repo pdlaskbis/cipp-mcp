@@ -211,7 +211,9 @@ describe('Deliverable 3 tools', () => {
       });
       expect(res.verified).toBe(true);
       expect(res.relationshipId).toBe('rel-123');
-      expect(res.inviteUrl).toMatch(/granularAdminRelationships\/rel-123$/);
+      expect(res.inviteUrl).toBe(
+        'https://admin.cloud.microsoft/AdminPortal/Home#/partners/invitation/granularAdminRelationships/rel-123',
+      );
       expect(res.onboardingUrl).toMatch(/onboarding\/start\?id=rel-123$/);
     });
 
