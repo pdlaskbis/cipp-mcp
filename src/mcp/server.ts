@@ -15,6 +15,7 @@ import { Logger } from '../utils/logger.js';
 import { McpServerConfig } from '../types/index.js';
 import { EnvironmentConfig, parseCredentialsFromHeaders } from '../utils/config.js';
 import { CippToolHandler } from '../handlers/tool.handler.js';
+import { CippOwnerToolHandler } from '../handlers/owner.handler.js';
 
 export class CippMcpServer {
   private server: Server;
@@ -31,7 +32,7 @@ export class CippMcpServer {
     this.envConfig = envConfig;
 
     this.cippService = new CippService(config, logger);
-    this.toolHandler = new CippToolHandler(this.cippService, logger);
+    this.toolHandler = new CippOwnerToolHandler(this.cippService, logger);
 
     this.server = this.createFreshServer();
   }
@@ -222,7 +223,7 @@ Tool categories:
           };
 
           cippService = new CippService(requestConfig, this.logger);
-          toolHandler = new CippToolHandler(cippService, this.logger);
+          toolHandler = new CippOwnerToolHandler(cippService, this.logger);
         }
 
         const server = new Server(
