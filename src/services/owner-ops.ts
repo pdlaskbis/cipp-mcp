@@ -82,6 +82,14 @@ interface ManagedDevice {
   azureADDeviceId?: string;
 }
 
+interface Assignment {
+  intent?: string;
+  target?: { '@odata.type'?: string; groupId?: string };
+}
+
+const INCLUDE_TYPE = '#microsoft.graph.groupAssignmentTarget';
+const EXCLUDE_TYPE = '#microsoft.graph.exclusionGroupAssignmentTarget';
+
 interface CaPolicy {
   id?: string;
   displayName?: string;
@@ -127,7 +135,8 @@ export class OwnerOps {
       tenantFilter: tenant,
       Endpoint: endpoint,
       SkipCache: true,
-      NoPagination: true,
+      // No NoPagination: CIPP then follows every Graph page. With it, only the
+      // first page comes back and large tenants would be silently truncated.
       ...extra,
     });
     const rows = Array.isArray(res) ? res : (res as { Results?: unknown })?.Results;
@@ -351,7 +360,19 @@ export class OwnerOps {
       }
       names[g] = String(hit.displayName ?? g);
     }
-    const before = await this.graph<{ target?: { groupId?: string } }>(tenant, assignmentsEndpoint);
+    const before = await this.graph<Assignment>(tenant, assignmentsEndpoint);
+    // CIPP's "append" still REPLACES an existing assignment for the same group
+    // (direction, filter, intent). So a group that already has any assignment
+    // here is refused, never rewritten: change those in the portal.
+    const already = [...include, ...exclude].filter((g) =>
+      before.some((a) => eqi(a?.target?.groupId, g))
+    );
+    if (already.length) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Already assigned here: ${already.map((g) => names[g]).join(', ')}. This tool only adds new groups and never rewrites an existing assignment (CIPP would replace its direction, filter or intent). Change it in the portal. Nothing was sent.`
+      );
+    }
     const preview = {
       kind: args.kind,
       id,
@@ -390,11 +411,21 @@ export class OwnerOps {
       submission = await this.req<unknown>('POST', 'ExecAssignPolicy', undefined, body);
     }
 
-    let after: Array<{ target?: { groupId?: string } }> = [];
+    const wantIntent = String(args.appIntent ?? 'Required').toLowerCase();
+    const landed = (rows: Assignment[], g: string, type: string) =>
+      rows.some(
+        (a) =>
+          eqi(a?.target?.groupId, g) &&
+          a?.target?.['@odata.type'] === type &&
+          (args.kind !== 'app' || type === EXCLUDE_TYPE || String(a?.intent ?? '').toLowerCase() === wantIntent)
+      );
+    let after: Assignment[] = [];
     const ok = await this.pollUntil(async () => {
-      after = await this.graph(tenant, assignmentsEndpoint);
-      const present = new Set(after.map((a) => String(a?.target?.groupId ?? '').toLowerCase()));
-      return [...include, ...exclude].every((g) => present.has(g.toLowerCase()));
+      after = await this.graph<Assignment>(tenant, assignmentsEndpoint);
+      return (
+        include.every((g) => landed(after, g, INCLUDE_TYPE)) &&
+        exclude.every((g) => landed(after, g, EXCLUDE_TYPE))
+      );
     });
     return {
       status: ok ? 'verified' : 'unverified',
@@ -406,7 +437,9 @@ export class OwnerOps {
       readback: { assignments: after.length },
       message: ok
         ? `Assignments added and confirmed (${after.length} total on the ${args.kind}).`
-        : 'Assignment was sent but the new groups did not read back in time. Re-check before reporting success.',
+        : 'Assignment was sent but the groups did not read back with the right direction' +
+          (args.kind === 'app' ? ' and intent' : '') +
+          ' in time. Re-check before reporting success.',
     };
   }
 
