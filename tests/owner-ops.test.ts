@@ -26,6 +26,10 @@ function fake(state: {
   assignments?: Array<Record<string, unknown>>;
   ca?: Array<Record<string, unknown>>;
   applyWrites?: boolean;
+  /** Simulate CIPP landing an exclusion as an inclusion. */
+  writeAsInclude?: boolean;
+  /** Simulate a stale or wrong app intent on readback. */
+  writeIntent?: string;
 }) {
   const s = {
     devices: state.devices ?? [{ id: DEV, deviceName: 'BIS-TECH-99', userPrincipalName: 'a@contoso.com', serialNumber: 'SN1' }],
@@ -53,9 +57,14 @@ function fake(state: {
       return { Results: 'ok' } as X;
     }
     if (method === 'POST' && (path === 'ExecAssignPolicy' || path === 'ExecAssignApp')) {
-      if (apply)
-        for (const g of [...((body?.GroupIds as string[]) ?? []), ...((body?.ExcludeGroupIds as string[]) ?? [])])
-          s.assignments.push({ target: { groupId: g } });
+      const intent = state.writeIntent ?? (body?.Intent as string | undefined)?.toLowerCase();
+      const inc = state.writeAsInclude ? '#microsoft.graph.groupAssignmentTarget' : '#microsoft.graph.exclusionGroupAssignmentTarget';
+      if (apply) {
+        for (const g of (body?.GroupIds as string[]) ?? [])
+          s.assignments.push({ intent, target: { '@odata.type': '#microsoft.graph.groupAssignmentTarget', groupId: g } });
+        for (const g of (body?.ExcludeGroupIds as string[]) ?? [])
+          s.assignments.push({ intent, target: { '@odata.type': inc, groupId: g } });
+      }
       return { Results: 'ok' } as X;
     }
     if (method === 'POST' && path === 'EditCAPolicy') {
@@ -181,6 +190,40 @@ describe('cipp_owner_assign', () => {
     const { ops, calls } = fake({});
     await ops.assign({ tenantFilter: T, kind: 'app', id: POL, groupIds: [GRP], confirm: true });
     expect(writes(calls)[0]).toMatchObject({ path: 'ExecAssignApp', body: { Intent: 'Required', assignmentMode: 'append' } });
+  });
+
+  it('refuses a group that already has any assignment (CIPP would replace it)', async () => {
+    const { ops, calls } = fake({
+      assignments: [{ target: { '@odata.type': '#microsoft.graph.exclusionGroupAssignmentTarget', groupId: GRP } }],
+    });
+    await expect(
+      ops.assign({ tenantFilter: T, kind: 'policy', policyType: 'configurationPolicies', id: POL, groupIds: [GRP], confirm: true })
+    ).rejects.toThrow(/Already assigned here: AIT - All Staff/);
+    expect(writes(calls)).toHaveLength(0);
+  });
+
+  it('exclusion is verified only when it reads back as an exclusion', async () => {
+    const good = fake({});
+    const r1 = await good.ops.assign({ tenantFilter: T, kind: 'policy', policyType: 'configurationPolicies', id: POL, excludeGroupIds: [GRP], confirm: true });
+    expect(r1.verified).toBe(true);
+    const wrong = fake({ writeAsInclude: true });
+    const r2 = await wrong.ops.assign({ tenantFilter: T, kind: 'policy', policyType: 'configurationPolicies', id: POL, excludeGroupIds: [GRP], confirm: true });
+    expect(r2.status).toBe('unverified');
+  });
+
+  it('app assignment is verified only with the requested intent', async () => {
+    const good = fake({});
+    const r1 = await good.ops.assign({ tenantFilter: T, kind: 'app', id: POL, groupIds: [GRP], appIntent: 'Available', confirm: true });
+    expect(r1.verified).toBe(true);
+    const stale = fake({ writeIntent: 'required' });
+    const r2 = await stale.ops.assign({ tenantFilter: T, kind: 'app', id: POL, groupIds: [GRP], appIntent: 'Available', confirm: true });
+    expect(r2.status).toBe('unverified');
+  });
+
+  it('reads follow every Graph page (no NoPagination)', async () => {
+    const { ops, calls } = fake({});
+    await ops.listIntuneDevices(T);
+    expect(calls[0].params).not.toHaveProperty('NoPagination');
   });
 
   it('refuses no groups, unknown groups and a missing policyType', async () => {
